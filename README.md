@@ -2,7 +2,7 @@
 
 Bash scripts for running Windows games from sources you don't fully trust on Linux. Each game runs in a firejail sandbox with no network, and a monitor watches for suspicious behavior.
 
-I made this for myself because I like trying small indie games and didn't want to double-click unknown .exe files on my main machine.
+I made this for myself because I try games from unsafe sources and didn't want to double-click unknown .exe files on my main machine.
 
 <img width="1909" height="1074" alt="image" src="https://github.com/user-attachments/assets/883a3f16-3a83-4bd7-b482-025a6f1e0183" />
 
