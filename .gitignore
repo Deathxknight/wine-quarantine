@@ -1,0 +1,4 @@
+*/
+*.log
+.reg-snapshot/
+config.local.sh

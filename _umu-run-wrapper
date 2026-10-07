@@ -1,0 +1,23 @@
+#!/bin/bash
+# _umu-run-wrapper <exe-relative-path>
+#
+# Runs inside the firejail sandbox. Takes the exe as argv so nothing needs
+# shell interpolation inside the sandbox. umu-run reads XDG_DATA_HOME
+# (set by the launcher to UMU_DATA) as its data dir.
+
+set -euo pipefail
+
+EXE_REL="${1:?usage: _umu-run-wrapper <exe-relative-path>}"
+
+: "${LUTRIS_UMU:?LUTRIS_UMU not set}"
+
+if [ ! -x "$LUTRIS_UMU" ]; then
+  echo "FATAL: umu-run not executable at $LUTRIS_UMU" >&2
+  exit 1
+fi
+
+# Skip the Steam Runtime (pressure-vessel); it doesn't work under firejail.
+# Proton runs directly against the host libraries, inside the sandbox.
+export UMU_NO_RUNTIME=1
+
+exec python3 "$LUTRIS_UMU" "$EXE_REL"
