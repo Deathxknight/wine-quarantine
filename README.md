@@ -24,8 +24,6 @@ If you think a file is real malware, use a VM or don't run it.
 - A Proton build in Steam's `compatibilitytools.d` (Proton-GE works)
 - `unzip`, `unrar` or `7z` if you want to use archives
 
-Tested with firejail 0.9.80, umu-launcher 1.4.4 and GE-Proton11-6.
-
 ## Setup
 
 The scripts look for Steam in `~/.local/share/Steam` and for `umu-run` on your PATH or in Lutris's runtime folder. If yours live somewhere else, create a file called `config.local.sh` next to `config.sh`:
@@ -43,10 +41,10 @@ If you edit `verify-sandbox.sh`, regenerate its hash with `./verify-sandbox.sh -
 
 ```bash
 ./new-quarantine.sh "My Game" ~/Downloads/mygame.zip
-./launch.sh "My Game"
+"./My Game/launch-quarantine.sh"
 ```
 
-The first command unpacks the game and picks the exe, which is saved in `My Game/game.conf`. The second runs it in the sandbox with the monitor. Logs go in `My Game/logs/`.
+The first command unpacks the game and picks the exe, which is saved in `My Game/game.conf`. It also writes `My Game/launch-quarantine.sh`, which you run to start the game in the sandbox with the monitor. It only calls the shared `_launch-core.sh`, so fixes there apply to every game. If a game picked the wrong exe, edit `EXE=` in `My Game/game.conf`. Logs go in `My Game/logs/`.
 
 Only the `game/` and `prefix/` folders are writable from inside the sandbox. The rest of the game folder, including `game.conf` and the logs, is hidden from the game.
 

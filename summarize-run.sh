@@ -16,6 +16,7 @@ RUNTIME_COUNT=$(echo -n "$RUNTIME_INFO" | grep -c "^" 2>/dev/null || echo 0)
 [ -z "$WARNS" ] && WARN_COUNT=0
 [ -z "$RUNTIME_INFO" ] && RUNTIME_COUNT=0
 
+# find newest regdiff log for this run, if any
 LATEST_REGDIFF=$(ls -t "$GAMEDIR/logs"/regdiff-*.log 2>/dev/null | head -n1)
 
 echo

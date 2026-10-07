@@ -1,5 +1,5 @@
 #!/bin/bash
-# launch.sh <GameName>
+# _launch-core.sh <GameName>  (internal, called by each game's launch-quarantine.sh)
 # Runs a quarantined game in the sandbox with the monitor attached.
 
 set -euo pipefail
@@ -9,7 +9,7 @@ QROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 source "$QROOT/config.sh" || { echo "FATAL: cannot load $QROOT/config.sh" >&2; exit 1; }
 check_deps || exit 1
 
-[ $# -eq 1 ] || { echo "Usage: launch.sh <GameName>" >&2; exit 1; }
+[ $# -eq 1 ] || { echo "Usage: _launch-core.sh <GameName>" >&2; exit 1; }
 GAMENAME="${1%/}"
 case "$GAMENAME" in
   ""|*/*|.|..) echo "Error: invalid game name '$1'" >&2; exit 1 ;;

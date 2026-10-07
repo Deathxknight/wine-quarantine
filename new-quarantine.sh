@@ -100,8 +100,16 @@ else
   EXE="CHANGE_ME.exe"
 fi
 
-# per-game settings are plain data, read by launch.sh without evaluating anything
+# per-game settings are plain data, read by _launch-core.sh without evaluating anything
 printf '# exe path, relative to game/\nEXE=%s\n' "$EXE" > "$GAMEDIR/game.conf"
+
+# convenience wrapper: no embedded data, resolves everything from its own location
+cat > "$GAMEDIR/launch-quarantine.sh" <<'EOF'
+#!/bin/bash
+D="$(dirname "$(readlink -f "$0")")"
+exec "$(dirname "$D")/_launch-core.sh" "$(basename "$D")"
+EOF
+chmod +x "$GAMEDIR/launch-quarantine.sh"
 
 trap - EXIT
 
@@ -110,4 +118,4 @@ echo "=== Done ==="
 echo "Game dir:  $GAMEDIR"
 echo "Exe:       $EXE"
 echo "Proton:    $(find_proton "$GAMEDIR" || echo 'none found')"
-echo "Run it:    $QROOT/launch.sh \"$GAMENAME\""
+echo "Launcher:  $GAMEDIR/launch-quarantine.sh"

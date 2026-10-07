@@ -1,6 +1,6 @@
 #!/bin/bash
-# reg-diff.sh snapshot <GAMEDIR>
-# reg-diff.sh compare <GAMEDIR> <ALERTLOG>
+# reg-diff.sh snapshot <GAMEDIR>   -- take a pre-run snapshot
+# reg-diff.sh compare <GAMEDIR> <ALERTLOG>  -- diff against snapshot , log results
 
 MODE="$1"
 GAMEDIR="$2"
@@ -53,10 +53,12 @@ case "$MODE" in
         echo
       } >> "$DIFFLOG"
 
+      # Count the diff shape
       ADDED=$(echo "$DIFF"   | grep -c '^> ' || true)
       REMOVED=$(echo "$DIFF" | grep -c '^< ' || true)
       CHANGED=$(echo "$DIFF" | grep -c '^[<>] ' || true)
 
+      # Persistence keys
       PERSIST_HITS=$(echo "$DIFF" \
         | grep -A1 -iE "^> \[.*\\\\($PERSIST_PATHS)" \
         | grep -E '^\> ".*"=')
@@ -65,6 +67,7 @@ case "$MODE" in
         continue
       fi
 
+      # system32
       if echo "$DIFF" | grep -qiE '^< \[.*\\\\(Image File Execution Options|Winlogon|Services|AppInit_DLLs|BootExecute)'; then
         log ALERT "Security-relevant key removed in $f — see $DIFFLOG"
         continue
@@ -75,7 +78,7 @@ case "$MODE" in
 
     [ "$FOUND_ANYTHING" -eq 0 ] && log INFO "Registry unchanged vs pre-run snapshot"
 
-    # current state becomes the baseline for the next run
+
     for f in $REGFILES; do
       if [ -f "$PREFIX/$f" ]; then
         cp -f "$PREFIX/$f" "$SNAPDIR/$f.before"
