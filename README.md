@@ -4,6 +4,8 @@ Bash scripts for running Windows games from sources you don't fully trust on Lin
 
 I made this for myself because I like trying small indie games and didn't want to double-click unknown .exe files on my main machine.
 
+<img width="1909" height="1074" alt="image" src="https://github.com/user-attachments/assets/883a3f16-3a83-4bd7-b482-025a6f1e0183" />
+
 ## This is not total protection
 
 It makes running a sketchy game less risky, not safe.
