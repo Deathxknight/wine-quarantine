@@ -102,18 +102,33 @@ check_deps() {
   return 0
 }
 
+detect_parent_terminal() {
+  local pid=$$ comm
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+    case "$comm" in
+      konsole)          echo konsole;        return 0 ;;
+      kitty)            echo kitty;          return 0 ;;
+      alacritty)        echo alacritty;      return 0 ;;
+      foot)             echo foot;           return 0 ;;
+      wezterm*)         echo wezterm;        return 0 ;;
+      ghostty)          echo ghostty;        return 0 ;;
+      xfce4-terminal)   echo xfce4-terminal; return 0 ;;
+      xterm)            echo xterm;          return 0 ;;
+    esac
+    pid="$(awk '{ sub(/^[^)]*\) /,""); print $2 }' "/proc/$pid/stat" 2>/dev/null)"
+  done
+  return 1
+}
+
 detect_terminal() {
   if [ -n "$ALERT_TERMINAL" ]; then
     command -v "$ALERT_TERMINAL" >/dev/null 2>&1 && { echo "$ALERT_TERMINAL"; return 0; }
   fi
-  case "${TERM:-}" in
-    *kitty*)     command -v kitty     >/dev/null 2>&1 && { echo kitty;     return 0; } ;;
-    *alacritty*) command -v alacritty >/dev/null 2>&1 && { echo alacritty; return 0; } ;;
-    *foot*)      command -v foot      >/dev/null 2>&1 && { echo foot;      return 0; } ;;
-    *wezterm*)   command -v wezterm   >/dev/null 2>&1 && { echo wezterm;   return 0; } ;;
-    *ghostty*)   command -v ghostty   >/dev/null 2>&1 && { echo ghostty;   return 0; } ;;
-    *xterm*)     command -v xterm     >/dev/null 2>&1 && { echo xterm;     return 0; } ;;
-  esac
+  local pt
+  if pt="$(detect_parent_terminal)" && command -v "$pt" >/dev/null 2>&1; then
+    echo "$pt"; return 0
+  fi
   local t
   for t in kitty alacritty foot wezterm ghostty xterm \
            x-terminal-emulator gnome-terminal konsole xfce4-terminal; do
@@ -224,4 +239,15 @@ build_whitelist_args() {
     printf -- '--whitelist=%s\n' "$(readlink -f "$p")"
     printf -- '--read-only=%s\n' "$(readlink -f "$p")"
   done
+}
+
+# term_run <terminal> <title> <class|""> <cmd> [args...]
+# xterm needs -T / -class / -e; everything else keeps the old --title style.
+term_run() {
+  local term="$1" title="$2" class="$3"; shift 3
+  case "$(basename "$term")" in
+    xterm|uxterm) "$term" -T "$title" ${class:+-class "$class"} -e "$@" ;;
+    konsole)      "$term" -p "tabtitle=$title" -e "$@" ;;
+    *)            "$term" --title "$title" ${class:+--class "$class"} "$@" ;;
+  esac
 }

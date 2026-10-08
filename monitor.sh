@@ -68,9 +68,7 @@ log() {
 
     local term
     if term="$(detect_terminal 2>/dev/null)"; then
-      "$term" \
-        --title "Malware Alert: $(basename "$GAMEDIR")" \
-        --class malware-alert \
+      term_run "$term" "Malware Alert: $(basename "$GAMEDIR")" malware-alert \
         bash -c 'cat "$1"; echo; echo "--- press enter to close ---"; read -r' _ "$ALERTLOG" \
         >/dev/null 2>&1 &
     else

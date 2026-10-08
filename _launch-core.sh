@@ -110,7 +110,7 @@ fi
 
 TERM_BIN="$(detect_terminal 2>/dev/null || true)"
 if [ -n "$TERM_BIN" ]; then
-  "$TERM_BIN" --title "Malware Monitor: $GAMENAME" \
+  term_run "$TERM_BIN" "Malware Monitor: $GAMENAME" "" \
     bash -c '"$@"; exec bash' _ "$QROOT/monitor.sh" "$GAMEDIR" "$GAME_PID" "$ALERTLOG" &
   MONITOR_PID=$!
 fi
