@@ -83,7 +83,7 @@ NON_LO="${NON_LO# }"
                  || fail "non-loopback interfaces visible: $NON_LO"
 
 # $HOME should be a fresh tmpfs with at most firejail's shell startup files
-ALLOWED_HOME_ENTRIES=(.inputrc .zshrc .bashrc)
+ALLOWED_HOME_ENTRIES=(.inputrc .zshrc .bashrc .Xauthority)  # firejail --private copies this in for X11
 while IFS= read -r wl; do
   case "$wl" in
     "$HOME"/*) rest="${wl#"$HOME"/}"; ALLOWED_HOME_ENTRIES+=("${rest%%/*}") ;;
