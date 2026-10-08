@@ -125,12 +125,13 @@ detect_terminal() {
   if [ -n "$ALERT_TERMINAL" ]; then
     command -v "$ALERT_TERMINAL" >/dev/null 2>&1 && { echo "$ALERT_TERMINAL"; return 0; }
   fi
+  [ -n "${KONSOLE_VERSION:-}" ] && command -v konsole >/dev/null 2>&1 && { echo konsole; return 0; }
   local pt
   if pt="$(detect_parent_terminal)" && command -v "$pt" >/dev/null 2>&1; then
     echo "$pt"; return 0
   fi
   local t
-  for t in kitty alacritty foot wezterm ghostty xterm \
+  for t in kitty alacritty foot wezterm ghostty konsole xterm \
            x-terminal-emulator gnome-terminal konsole xfce4-terminal; do
     command -v "$t" >/dev/null 2>&1 && { echo "$t"; return 0; }
   done
