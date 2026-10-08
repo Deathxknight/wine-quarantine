@@ -54,4 +54,11 @@ Only the `game/` and `prefix/` folders are writable from inside the sandbox. The
 - Your whole Steam folder is mounted read-only inside the sandbox.
 - Registry persistence detection may miss values added to an existing key.
 
+## Potential* Upcoming Changes 
+
+- Isolate archive extractions - mostly for zip slips
+- monitor kernel queue_overflow kernel flag and kill if overwhelmed.
+- Sequential loop passing is slower , try move to bash regex.
+
+
 Issues and pull requests are welcome.
