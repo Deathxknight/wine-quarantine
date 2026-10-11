@@ -18,6 +18,7 @@ esac
 GAMEDIR="$QROOT/$GAMENAME"
 [ -d "$GAMEDIR/game" ] || { echo "Error: no such game: $GAMENAME" >&2; exit 1; }
 GAMEDIR="$(readlink -f "$GAMEDIR")"
+mkdir -p "$UMU_DATA"
 UMU_DATA="$(readlink -f "$UMU_DATA")"
 
 # exe comes from game.conf, which is only ever read as data
@@ -57,6 +58,12 @@ export PROTONPATH
 export XDG_DATA_HOME="$UMU_DATA"
 export GAMEDIR
 export LUTRIS_UMU
+
+# the runtime can't be downloaded from inside the sandbox (no network)
+if [ -n "$LUTRIS_UMU" ] && ! ls "$UMU_DATA/umu"/steamrt* >/dev/null 2>&1; then
+  echo "[launcher] umu runtime is not downloaded yet. Run ./install.sh once (needs internet), then launch again." >&2
+  exit 1
+fi
 
 PREFIX_FRESH=0
 [ ! -f "$GAMEDIR/prefix/system.reg" ] && PREFIX_FRESH=1

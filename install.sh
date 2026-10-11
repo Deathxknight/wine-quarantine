@@ -38,6 +38,14 @@ else PM=""; fi
 missing=()
 need() { if command -v "$1" >/dev/null 2>&1; then ok "$1"; else bad "$1 missing"; missing+=("$2"); fi; }
 need firejail firejail
+if command -v umu-run >/dev/null 2>&1 && [ "$(head -c2 "$(command -v umu-run)")" != $'PK' ]; then
+  ok "umu-run ($(command -v umu-run))"
+else
+  warn "umu-run not found or is a ZIP archive (not executable)"
+  echo "    Install umu-launcher from your distro, or from:"
+  echo "    https://github.com/Open-Wine-Components/umu-launcher/releases"
+fi
+
 need inotifywait inotify-tools
 need python3 "${PY:-python3}"
 need unzip unzip
@@ -87,7 +95,34 @@ else
   esac
 fi
 
-# --- 4. integration + launcher ---------------------------------------------
+# --- 4. umu runtime (one-time download) -------------------------------------
+# same call new-quarantine.sh makes on first use. needs a Proton build, so it
+# runs after the check above. any steamrt* folder counts.
+echo; echo "umu runtime"
+UMU_DATA="$QROOT/_umu-data"
+mkdir -p "$UMU_DATA/umu"
+if ls "$UMU_DATA/umu"/steamrt* >/dev/null 2>&1; then
+  ok "already downloaded ($(basename "$(ls -d "$UMU_DATA/umu"/steamrt* | head -n1)"))"
+elif [ -z "$UMU" ] || [ ! -x "$UMU" ]; then
+  warn "skipped, umu-run not found (see above)"
+elif [ -z "$PROTON" ]; then
+  warn "skipped, it needs a Proton build first (see above)"
+else
+  echo "  downloading (about 200MB, once, needs internet). umu prints its own progress:"
+  echo
+  PRIME_PFX="$(mktemp -d)"
+  XDG_DATA_HOME="$UMU_DATA" WINEPREFIX="$PRIME_PFX" PROTONPATH="$PROTON" GAMEID=umu-default python3 "$UMU" /bin/true
+  rc=$?
+  rm -rf "$PRIME_PFX"
+  echo
+  if ls "$UMU_DATA/umu"/steamrt* >/dev/null 2>&1; then
+    ok "umu runtime ready"
+  else
+    bad "download did not finish (umu exit code $rc). Check your connection and run install.sh again."
+  fi
+fi
+
+# --- 5. integration + launcher ---------------------------------------------
 echo; echo "wq-ui"
 if grep -q "wq-ui integration" _launch-core.sh 2>/dev/null; then ok "integration already applied"
 else echo "  applying integration..."; python3 wq-ui/integrate.py && ok "integration applied"; fi
@@ -117,3 +152,5 @@ echo
 echo "Next:"
 echo "  ./wq                                   open the UI (Debug button = setup check + report)"
 echo "  ./new-quarantine.sh \"My Game\" ~/Downloads/mygame.zip"
+
+mkdir -p "$QROOT/_umu-data" && ok "_umu-data directory"
