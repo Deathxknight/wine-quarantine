@@ -70,8 +70,6 @@ STEAM_ROOT="/path/to/Steam"
 LUTRIS_UMU="/path/to/umu-run"
 ```
 
-It's gitignored, so it won't get committed. If you installed `umu-run` some unusual way and the game can't find it inside the sandbox, add its folder to `QUARANTINE_RO_PATHS` in the same file.
-
 To use the app, wire it into the scripts once, then start it:
 
 ```bash
