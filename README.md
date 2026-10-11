@@ -4,6 +4,8 @@ Scripts and a small Qt app for running games from sources you don't fully trust 
 
 I made this for myself because I like trying small indie games and didn't want to double-click unknown files on my main machine. It handles Windows games (through Proton) and native Linux games (shell scripts, binaries, AppImages).
 
+<img width="1903" height="1009" alt="image" src="https://github.com/user-attachments/assets/659aa1e9-97cb-449f-8c18-198792502f10" />
+
 ## This is not total protection
 
 It makes running a sketchy game less risky, not safe.
