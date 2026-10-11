@@ -1,0 +1,11 @@
+# Add to ~/.config/matugen/config.toml, then copy the two templates to
+# ~/.config/matugen/templates/ and run matugen as usual.
+[templates.wq_ui_dark]
+input_path  = '~/.config/matugen/templates/wq-ui-dark.css'
+output_path = '~/.config/wq-ui/matugen-dark.css'
+
+[templates.wq_ui_light]
+input_path  = '~/.config/matugen/templates/wq-ui-light.css'
+output_path = '~/.config/wq-ui/matugen-light.css'
+
+# Then in wq-ui: Settings -> CSS file = ~/.config/wq-ui/matugen-{mode}.css

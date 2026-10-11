@@ -1,0 +1,13 @@
+/* matugen template -> ~/.config/wq-ui/matugen-light.css
+ * wq-ui reads these as colour tokens and re-themes itself live when the file changes.
+ * Anything below the @define-color lines is plain Qt stylesheet, applied on top. */
+@define-color surface                {{colors.surface.light.hex}};
+@define-color surface_container      {{colors.surface_container.light.hex}};
+@define-color surface_container_high {{colors.surface_container_high.light.hex}};
+@define-color on_surface             {{colors.on_surface.light.hex}};
+@define-color on_surface_variant     {{colors.on_surface_variant.light.hex}};
+@define-color primary                {{colors.primary.light.hex}};
+@define-color on_primary             {{colors.on_primary.light.hex}};
+@define-color outline                {{colors.outline.light.hex}};
+@define-color error                  {{colors.error.light.hex}};
+@define-color ok                     {{colors.tertiary.light.hex}};

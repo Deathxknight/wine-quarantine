@@ -37,13 +37,18 @@ LOGDIR="$GAMEDIR/logs"
 mkdir -p "$LOGDIR"
 ALERTLOG="$LOGDIR/alerts-$(date +%Y%m%d-%H%M%S).log"
 
+# everything printed from here on (sandbox verify failures, umu tracebacks...)
+# is also saved, so the wq-ui Debug report can include it
+LAUNCHLOG="$LOGDIR/launch-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LAUNCHLOG") 2>&1
+
 PROTONPATH="$(find_proton "$GAMEDIR" || true)"
 [ -n "$PROTONPATH" ] || { echo "FATAL: no Proton build found. See config.sh." >&2; exit 1; }
 WINESERVER="$(find_wineserver "$PROTONPATH" || true)"
 
 # prune old logs
 find "$LOGDIR" -maxdepth 1 -type f \
-  \( -name 'alerts-*.log' -o -name 'regdiff-*.log' \) \
+  \( -name 'alerts-*.log' -o -name 'regdiff-*.log' -o -name 'launch-*.log' \) \
   -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 
 export EXE_REL_PATH
@@ -56,8 +61,10 @@ export LUTRIS_UMU
 PREFIX_FRESH=0
 [ ! -f "$GAMEDIR/prefix/system.reg" ] && PREFIX_FRESH=1
 
+apply_game_profile "$GAMEDIR"  # wq-ui integration
 mapfile -t WL_ARGS < <(build_whitelist_args "$GAMEDIR" "$UMU_DATA")
 mapfile -t BL_ARGS < <(build_blacklist_args)
+mapfile -t -O "${#WL_ARGS[@]}" WL_ARGS < <(profile_extra_whitelist_args)  # wq-ui integration
 
 # verify-sandbox.sh reads these from inside the sandbox
 export QVERIFY_GAMEDIR="$GAMEDIR"
@@ -108,10 +115,18 @@ if ! kill -0 "$GAME_PID" 2>/dev/null; then
   exit 1
 fi
 
-TERM_BIN="$(detect_terminal 2>/dev/null || true)"
-if [ -n "$TERM_BIN" ]; then
-  term_run "$TERM_BIN" "Malware Monitor: $GAMENAME" "" \
-    bash -c '"$@"; exec bash' _ "$QROOT/monitor.sh" "$GAMEDIR" "$GAME_PID" "$ALERTLOG" &
+# wq-ui: run the monitor in the background; the Qt UI tails logs/alerts-*.log,
+# so no visible terminal is needed. Set WQ_MONITOR_TERMINAL=1 to restore the old behaviour.
+if [ "${WQ_MONITOR_TERMINAL:-0}" = "1" ]; then
+  TERM_BIN="$(detect_terminal 2>/dev/null || true)"
+  if [ -n "$TERM_BIN" ]; then
+    term_run "$TERM_BIN" "Malware Monitor: $GAMENAME" "" \
+      bash -c '"$@"; if [ "${WQ_MONITOR_HOLD:-0}" = 1 ]; then exec bash; fi' _ "$QROOT/monitor.sh" "$GAMEDIR" "$GAME_PID" "$ALERTLOG" &
+    MONITOR_PID=$!
+  fi
+else
+  "$QROOT/monitor.sh" "$GAMEDIR" "$GAME_PID" "$ALERTLOG" \
+    >>"$GAMEDIR/logs/monitor.out" 2>&1 &
   MONITOR_PID=$!
 fi
 

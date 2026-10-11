@@ -40,7 +40,6 @@ flush_log() {
   local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
   local tmp; tmp="$(mktemp)"
   mv "$LOG_BUFFER_LOCK" "$tmp" 2>/dev/null || return 0
-  : > "$LOG_BUFFER_LOCK"
   while IFS=$'\t' read -r level msg; do
     [ -z "$level" ] && continue
     echo "[$ts] [$level] $msg" >> "$ALERTLOG"
@@ -50,12 +49,13 @@ flush_log() {
 
 log() {
   local level="$1" msg="$2"
+  msg="${msg//[[:cntrl:]]/}"   # file/process names can carry escape sequences
   buffer_event "$level" "$msg"
 
   case "$level" in
-    ALERT) echo -e "${RED}[ALERT] $msg${NC}" ;;
-    WARN)  echo -e "${YEL}[WARN]  $msg${NC}" ;;
-    INFO)  echo -e "${GRN}[INFO]  $msg${NC}" ;;
+    ALERT) printf '%b[ALERT] %s%b\n' "$RED" "$msg" "$NC" ;;
+    WARN)  printf '%b[WARN]  %s%b\n' "$YEL" "$msg" "$NC" ;;
+    INFO)  printf '%b[INFO]  %s%b\n' "$GRN" "$msg" "$NC" ;;
   esac
 
   if [ "$level" = "ALERT" ] && [ "$KILL_FIRED" -eq 0 ]; then
@@ -85,7 +85,6 @@ log() {
       ts=$(date '+%Y-%m-%d %H:%M:%S')
       tmp="$(mktemp)"
       mv "$LOG_BUFFER_LOCK" "$tmp" 2>/dev/null || continue
-      : > "$LOG_BUFFER_LOCK"
       while IFS=$'\t' read -r level msg; do
         [ -z "$level" ] && continue
         echo "[$ts] [$level] $msg" >> "$ALERTLOG"
@@ -102,7 +101,11 @@ SUSPICIOUS_EXT='\.ps1$|\.psm1$|\.ps1xml$|\.bat$|\.cmd$|\.vbs$|\.vbe$|\.js$|\.jse
 
 EXEC_EXT='\.exe$|\.dll$|\.scr$|\.com$|\.pif$|\.sys$'
 
-KNOWN_RUNTIME='d3d(8|9|10core|11|12|12core)\.dll$|dxgi\.dll$|icu(in|uc|dt)68\.dll$|nvapi(64)?\.dll$|nvcuda\.dll$|nvngx\.dll$|nvofapi64\.dll$|vrclient(_x64)?\.dll$|openvr_api_dxvk\.dll$|discord.*bridge\.exe$|dxvk_config\.dll$|d3dcompiler_47\.dll$|xalia\.exe$|UnityCrashHandler(64)?\.exe$|crashpad_handler\.exe$|msvcp.*\.dll$|vcruntime.*\.dll$|ucrtbase.*\.dll$|d3dx9_.*\.dll$|x3daudio.*\.dll$|xapofx.*\.dll$|xinput.*\.dll$|windows\.networking\.dll$|windows\.devices\..*\.dll$|kernelbase\.dll$|oleaut32\.dll$|winsta\.dll$|cabinet\.dll$|advpack\.dll$|cryptext\.dll$|pstorec\.dll$|sspicli\.dll$|wineopenxr\.dll$|ntdll\.dll$|kernel32\.dll$|user32\.dll$|gdi32\.dll$|shell32\.dll$|combase\.dll$|comctl32\.dll$|rpcrt4\.dll$|sechost\.dll$|setupapi\.dll$|shlwapi\.dll$|winmm\.dll$|ws2_32\.dll$|imm32\.dll$|hid\.dll$|dinput.*\.dll$|dsound\.dll$|dwmapi\.dll$|uxtheme\.dll$|version\.dll$|winspool\.dll$|wldap32\.dll$|crypt32\.dll$|bcrypt\.dll$|ncrypt\.dll$|dbghelp\.dll$|wintrust\.dll$|mpr\.dll$|netapi32\.dll$|userenv\.dll$|propsys\.dll$|dwrite\.dll$|d2d1\.dll$|windowscodecs\.dll$|wtsapi32\.dll$|cfgmgr32\.dll$|powrprof\.dll$|psapi\.dll$|iphlpapi\.dll$|dnsapi\.dll$|wininet\.dll$|urlmon\.dll$|msimg32\.dll$|opengl32\.dll$|glu32\.dll$|secur32\.dll$|authz\.dll$|sxs\.dll$|msvcrt\.dll$|msvcr.*\.dll$'
+KNOWN_RUNTIME='d3d(8|9|10core|11|12|12core)\.dll$|dxgi\.dll$|icu(in|uc|dt)68\.dll$|_?nvapi(64)?\.dll$|nvcuda\.dll$|_?nvngx\.dll$|_?nvofapi64\.dll$|vrclient(_x64)?\.dll$|openvr_api_dxvk\.dll$|discord.*bridge\.exe$|dxvk_config\.dll$|d3dcompiler_47\.dll$|xalia\.exe$|UnityCrashHandler(64)?\.exe$|crashpad_handler\.exe$|msvcp.*\.dll$|vcruntime.*\.dll$|ucrtbase\.dll$|d3dx9_.*\.dll$|x3daudio.*\.dll$|xapofx.*\.dll$|xinput.*\.dll$|windows\.networking\.dll$|windows\.devices\..*\.dll$|kernelbase\.dll$|oleaut32\.dll$|winsta\.dll$|cabinet\.dll$|advpack\.dll$|cryptext\.dll$|pstorec\.dll$|sspicli\.dll$|wineopenxr\.dll$|ntdll\.dll$|kernel32\.dll$|user32\.dll$|gdi32\.dll$|shell32\.dll$|combase\.dll$|comctl32\.dll$|rpcrt4\.dll$|sechost\.dll$|setupapi\.dll$|shlwapi\.dll$|winmm\.dll$|ws2_32\.dll$|imm32\.dll$|hid\.dll$|dinput.*\.dll$|dsound\.dll$|dwmapi\.dll$|uxtheme\.dll$|version\.dll$|winspool\.dll$|wldap32\.dll$|crypt32\.dll$|bcrypt\.dll$|ncrypt\.dll$|dbghelp\.dll$|wintrust\.dll$|mpr\.dll$|netapi32\.dll$|userenv\.dll$|propsys\.dll$|dwrite\.dll$|d2d1\.dll$|windowscodecs\.dll$|wtsapi32\.dll$|cfgmgr32\.dll$|powrprof\.dll$|psapi\.dll$|iphlpapi\.dll$|dnsapi\.dll$|wininet\.dll$|urlmon\.dll$|msimg32\.dll$|opengl32\.dll$|glu32\.dll$|secur32\.dll$|authz\.dll$|sxs\.dll$|msvcrt\.dll$|msvcr.*\.dll$'
+
+# anchored: unanchored, "sync.exe" matched nc\.exe and "x-kernel32.dll" counted as known runtime
+KNOWN_RUNTIME="^(${KNOWN_RUNTIME})"
+SUSPICIOUS_PROCS="^(${SUSPICIOUS_PROCS})(\.exe)?$"
 
 PERSIST_KEYS='Run|RunOnce|RunServices|RunServicesOnce|Image File Execution Options|AppInit_DLLs|Winlogon|ShellServiceObjectDelayLoad|SharedTaskScheduler|Userinit|AppCertDlls|SilentProcessExit|KnownDLLs|BootExecute|Browser Helper Objects'
 
@@ -255,7 +258,7 @@ while kill -0 "$FIREJAIL_PID" 2>/dev/null; do
     cmd="$(read_cmdline "$pid")"
     [ -z "$cmd" ] && continue
     exe="${cmd%% *}"
-    exe_base="$(basename "$exe")"
+    exe_base="${exe##*[\\/]}"   # handles C:\windows\system32\cmd.exe too
 
     log INFO "New process: pid=$pid cmd=$cmd"
 
@@ -300,8 +303,8 @@ done
 
 # shutdown
 [ -n "$INOTIFY_PID" ] && {
+  pkill -P "$INOTIFY_PID" 2>/dev/null   # children first, or they get orphaned
   kill "$INOTIFY_PID" 2>/dev/null
-  pkill -P "$INOTIFY_PID" 2>/dev/null
 }
 
 sleep 1

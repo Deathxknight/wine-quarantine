@@ -1,0 +1,13 @@
+/* matugen template -> ~/.config/wq-ui/matugen-dark.css
+ * wq-ui reads these as colour tokens and re-themes itself live when the file changes.
+ * Anything below the @define-color lines is plain Qt stylesheet, applied on top. */
+@define-color surface                {{colors.surface.dark.hex}};
+@define-color surface_container      {{colors.surface_container.dark.hex}};
+@define-color surface_container_high {{colors.surface_container_high.dark.hex}};
+@define-color on_surface             {{colors.on_surface.dark.hex}};
+@define-color on_surface_variant     {{colors.on_surface_variant.dark.hex}};
+@define-color primary                {{colors.primary.dark.hex}};
+@define-color on_primary             {{colors.on_primary.dark.hex}};
+@define-color outline                {{colors.outline.dark.hex}};
+@define-color error                  {{colors.error.dark.hex}};
+@define-color ok                     {{colors.tertiary.dark.hex}};

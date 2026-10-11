@@ -1,4 +1,5 @@
 #!/bin/bash
+# wq-ui integration: checks are relaxed only for protections the profile disabled
 # verify-sandbox.sh - refuse to run the game unless the sandbox is enforced.
 #
 # Runs inside the firejail sandbox before the game is exec'd.
@@ -41,9 +42,12 @@ FAIL=0
 
 pass() { echo "[SANDBOX-VERIFY] ok:   $*" >&2; PASS=$((PASS+1)); }
 fail() { echo "[SANDBOX-VERIFY] FAIL: $*" >&2; FAIL=$((FAIL+1)); }
+# profile-disabled protections (QVERIFY_SKIP is set outside the sandbox)
+skipped() { case ",${QVERIFY_SKIP:-}," in *",$1,"*) return 0 ;; esac; return 1; }
 
 # capabilities
 for cap in CapEff CapPrm CapBnd CapAmb; do
+if skipped caps; then pass "capability check skipped by profile"; break; fi
   v=$(awk -v k="^$cap:" '$0 ~ k {print $2}' /proc/self/status)
   if [ -z "$v" ]; then
     fail "could not read $cap from /proc/self/status"
@@ -56,11 +60,15 @@ done
 
 # no_new_privs
 nnp=$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)
+if skipped nnp; then pass "NoNewPrivs check skipped by profile"; else
 [ "$nnp" = "1" ] && pass "NoNewPrivs=1" || fail "NoNewPrivs=$nnp, expected 1"
+fi
 
 # seccomp
 sec=$(awk '/^Seccomp:/ {print $2}' /proc/self/status)
+if skipped seccomp; then sec=skip; fi
 case "$sec" in
+skip) pass "Seccomp check skipped by profile" ;;
   2) pass "Seccomp=2 (filter mode)" ;;
   1) fail "Seccomp=1 (strict mode - some games need 2)" ;;
   0) fail "Seccomp=0 (no filter - sandbox is not enforcing syscall limits)" ;;
@@ -80,7 +88,7 @@ while IFS=: read -r iface rest; do
 done < /proc/self/net/dev
 NON_LO="${NON_LO# }"
 [ -z "$NON_LO" ] && pass "network namespace contains only lo" \
-                 || fail "non-loopback interfaces visible: $NON_LO"
+|| { if [ "${QVERIFY_NET:-off}" != off ]; then pass "network enabled by profile (${QVERIFY_NET}): $NON_LO"; else fail "non-loopback interfaces visible: $NON_LO"; fi; }
 
 # $HOME should be a fresh tmpfs with at most firejail's shell startup files
 ALLOWED_HOME_ENTRIES=(.inputrc .zshrc .bashrc .Xauthority)  # firejail --private copies this in for X11
@@ -97,8 +105,10 @@ while IFS= read -r entry; do
     [ "$entry" = "$a" ] && { allowed=1; break; }
   done
   if [ "$allowed" -eq 0 ]; then
-    fail "\$HOME/$entry present - real home leaked"
-    HOME_BAD=1
+if skipped home; then HOME_BAD=0; else
+fail "\$HOME/$entry present - real home leaked"
+HOME_BAD=1
+fi
   fi
 done < <(ls -A "$HOME" 2>/dev/null)
 [ "$HOME_BAD" -eq 0 ] && pass "\$HOME contains only expected shell files ($HOME)"

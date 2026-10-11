@@ -72,6 +72,12 @@ declare -p QUARANTINE_RO_PATHS >/dev/null 2>&1 || QUARANTINE_RO_PATHS=(
   "$STEAM_ROOT"
 )
 
+# additive: config.local.sh can set QUARANTINE_EXTRA_RO_PATHS to add paths
+# without replacing the defaults above
+if declare -p QUARANTINE_EXTRA_RO_PATHS >/dev/null 2>&1; then
+  QUARANTINE_RO_PATHS+=("${QUARANTINE_EXTRA_RO_PATHS[@]}")
+fi
+
 declare -p QUARANTINE_STEAM_CONFIG_PATHS >/dev/null 2>&1 || QUARANTINE_STEAM_CONFIG_PATHS=()
 
 check_deps() {
@@ -252,3 +258,9 @@ term_run() {
     *)            "$term" --title "$title" ${class:+--class "$class"} "$@" ;;
   esac
 }
+
+# wq-ui integration: per-game firejail profiles
+if [ -f "$QROOT/wq-ui/profile.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$QROOT/wq-ui/profile.sh"
+fi
