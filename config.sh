@@ -29,7 +29,10 @@ UMU_DATA="${UMU_DATA:-$QROOT/_umu-data}"
 STEAM_ROOT="${STEAM_ROOT:-$(detect_steam_root || true)}"
 LUTRIS_UMU="${LUTRIS_UMU:-$(detect_umu || true)}"
 
-declare -p PROTON_SEARCH_DIRS >/dev/null 2>&1 || PROTON_SEARCH_DIRS=( "$STEAM_ROOT/compatibilitytools.d" )
+if ! declare -p PROTON_SEARCH_DIRS >/dev/null 2>&1; then
+  PROTON_SEARCH_DIRS=( "$QROOT/_proton" )
+  if [ -n "$STEAM_ROOT" ]; then PROTON_SEARCH_DIRS+=( "$STEAM_ROOT/compatibilitytools.d" ); fi
+fi
 PROTON_PREFERRED="${PROTON_PREFERRED:-}"
 
 REQUIRED_BINS=(firejail inotifywait python3)
@@ -69,7 +72,6 @@ fi
 
 declare -p QUARANTINE_RO_PATHS >/dev/null 2>&1 || QUARANTINE_RO_PATHS=(
   "$UMU_RO_PATH"
-  "$STEAM_ROOT"
 )
 
 # additive: config.local.sh can set QUARANTINE_EXTRA_RO_PATHS to add paths
@@ -91,11 +93,21 @@ check_deps() {
     missing+=("$LUTRIS_UMU  (umu-run, not executable)")
   fi
   if [ -z "$STEAM_ROOT" ]; then
-    missing+=("Steam root not found (set STEAM_ROOT)")
+    :
   elif [ ! -d "$STEAM_ROOT" ]; then
-    missing+=("$STEAM_ROOT  (Steam root, not a directory)")
+    :
   fi
   [ -d "$QROOT" ] || missing+=("$QROOT  (quarantine root, not a directory)")
+  local pp ph
+  pp="$(find_proton "" 2>/dev/null || true)"
+  if [ -z "$pp" ]; then
+    missing+=("no Proton build found (run ./install.sh)")
+  else
+    ph="$(readlink -f "$HOME")"
+    case "$pp" in
+      "$ph"/*) missing+=("Proton is under \$HOME ($pp): firejail --private hides it. Run ./install.sh to move it to $QROOT/_proton") ;;
+    esac
+  fi
   if [ "${#missing[@]}" -gt 0 ]; then
     {
       echo "ERROR: sandbox dependencies missing or misconfigured:"
@@ -235,6 +247,12 @@ build_whitelist_args() {
     printf -- '--read-only=%s\n' "$qroot/$f"
   done
 
+  local pp
+  pp="$(find_proton "$gamedir" 2>/dev/null || true)"
+  if [ -n "$pp" ] && [ -d "$pp" ]; then
+    printf -- '--whitelist=%s\n' "$pp"
+    printf -- '--read-only=%s\n' "$pp"
+  fi
   for p in "${QUARANTINE_RO_PATHS[@]}"; do
     [ -e "$p" ] || continue
     printf -- '--whitelist=%s\n' "$(readlink -f "$p")"

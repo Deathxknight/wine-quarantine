@@ -65,6 +65,7 @@ if [ -n "$LUTRIS_UMU" ] && ! ls "$UMU_DATA/umu"/steamrt* >/dev/null 2>&1; then
   exit 1
 fi
 
+mkdir -p "$GAMEDIR/prefix"
 PREFIX_FRESH=0
 [ ! -f "$GAMEDIR/prefix/system.reg" ] && PREFIX_FRESH=1
 
@@ -92,7 +93,7 @@ if [ "$PREFIX_FRESH" -eq 1 ]; then
   env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
     firejail "${QUARANTINE_FIREJAIL_ARGS[@]}" "${WL_ARGS[@]}" "${BL_ARGS[@]}" -- \
       timeout 120 python3 "$LUTRIS_UMU" "./_bootstrap.bat" \
-      >/dev/null 2>&1 || true
+      >"$LOGDIR/bootstrap.log" 2>&1 || true
 
   rm -f "$BOOTSTRAP_BAT"
   if [ -n "$WINESERVER" ]; then
@@ -100,6 +101,11 @@ if [ "$PREFIX_FRESH" -eq 1 ]; then
     WINEPREFIX="$GAMEDIR/prefix" "$WINESERVER" -w 2>/dev/null || true
   fi
   sleep 2
+  if [ ! -f "$GAMEDIR/prefix/system.reg" ]; then
+    echo "FATAL: bootstrap did not create the prefix. Last lines of $LOGDIR/bootstrap.log:" >&2
+    tail -n 20 "$LOGDIR/bootstrap.log" >&2 || true
+    exit 1
+  fi
   echo "Bootstrap complete. Starting monitored run."
 fi
 

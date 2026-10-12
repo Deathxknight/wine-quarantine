@@ -2049,8 +2049,8 @@ class MainWindow(QMainWindow):
 
 # ---------------------------------------------------------------------------
 def find_qroot(settings: Settings) -> Path | None:
-    cands = [os.environ.get("WQ_ROOT"), settings.data.get("qroot"),
-             str(Path(__file__).resolve().parent.parent), os.getcwd()]
+    cands = [os.environ.get("WQ_ROOT"), str(Path(__file__).resolve().parent.parent),
+             settings.data.get("qroot"), os.getcwd()]
     for c in cands:
         if c and (Path(c) / "config.sh").is_file() and (Path(c) / "_launch-core.sh").is_file():
             return Path(c).resolve()
