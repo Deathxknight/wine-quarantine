@@ -49,6 +49,7 @@ find "$LOGDIR" -maxdepth 1 -type f \( -name 'alerts-*.log' -o -name 'launch-*.lo
 
 echo "wq: native launch of $GAMENAME ($EXE). verify-sandbox.sh is not run for native games."
 
+export WQ_RUNNER=native
 apply_game_profile "$GAMEDIR"
 
 # private home that persists, instead of firejail's throwaway one
@@ -73,6 +74,33 @@ cd "$EXEDIR"
 env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
   firejail "${FJ_ARGS[@]}" "${WL_ARGS[@]}" "${BL_ARGS[@]}" -- \
     bash -c '
+      # preflight: refuse to start the game if the jail is leaking (honours the
+      # profile opt-outs in QVERIFY_SKIP). verify-sandbox.sh is Wine-specific.
+      bad=0; sk=",${QVERIFY_SKIP:-},"
+      has() { case "$sk" in *",$1,"*) return 1 ;; *) return 0 ;; esac; }
+      leak() { echo "wq: SANDBOX LEAK: $*" >&2; bad=1; }
+      # group membership is only a note: firejail ignores --nogroups on NVIDIA
+      # systems, and what the groups would grant (sockets, /dev/input, sudo) is
+      # checked directly below and by --nonewprivs.
+      if has groups; then
+        for g in docker input libvirt wheel disk kvm; do
+          id -nG | tr " " "\n" | grep -qx "$g" && echo "wq: note: still in group $g (resources are blocked separately)" >&2
+        done
+      fi
+      if has sockets; then
+        for s in /run/docker.sock /var/run/docker.sock /run/libvirt/libvirt-sock; do
+          [ -S "$s" ] && leak "control socket visible: $s"
+        done
+      fi
+      if has input; then
+        for d in /dev/input/event*; do
+          [ -e "$d" ] && { leak "raw input device visible: $d"; break; }
+        done
+      fi
+      if has ns; then
+        unshare -U true 2>/dev/null && leak "user namespaces still allowed"
+      fi
+      [ "$bad" = 0 ] || { echo "wq: aborting launch" >&2; exit 97; }
       case "$WQ_EXE_NAME" in
         *.sh) exec bash "./$WQ_EXE_NAME" ;;
         *)    exec "./$WQ_EXE_NAME" ;;
@@ -84,7 +112,7 @@ if ! kill -0 "$GAME_PID" 2>/dev/null; then          # already gone, quick script
   GAME_RC=0
   wait "$GAME_PID" || GAME_RC=$?
   echo "wq: game exited within a second (code $GAME_RC)"
-  "$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" || true
+  sleep 1; "$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" "$GAME_RC" || true
   exit "$GAME_RC"
 fi
 
@@ -97,5 +125,6 @@ echo "wq: game exited with code $GAME_RC"
 for _ in 1 2 3 4 5; do kill -0 "$MONITOR_PID" 2>/dev/null || break; sleep 1; done
 wait "$MONITOR_PID" 2>/dev/null || true
 
-"$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" || true
+sleep 1   # let the tee'd launch log flush
+"$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" "$GAME_RC" || true
 exit "$GAME_RC"

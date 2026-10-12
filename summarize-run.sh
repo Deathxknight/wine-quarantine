@@ -2,6 +2,15 @@
 # summarize-run.sh <GAMEDIR> <ALERTLOG>
 GAMEDIR="$1"
 ALERTLOG="$2"
+GAME_RC="${3:-0}"   # optional: exit code of the sandboxed process
+
+# leaks reported from INSIDE the jail (reachability tests, native preflight).
+# these land in the launch log, not the monitor's alert log, so look there too.
+LEAKS=""
+LAUNCHLOG_LATEST=$(ls -t "$GAMEDIR/logs"/launch-*.log 2>/dev/null | head -n1)
+[ -n "$LAUNCHLOG_LATEST" ] && LEAKS=$(grep -E '\[LEAK\]|SANDBOX LEAK' "$LAUNCHLOG_LATEST" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | sort -u)
+LEAK_COUNT=0
+[ -n "$LEAKS" ] && LEAK_COUNT=$(printf '%s\n' "$LEAKS" | grep -c '^')
 
 RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'; BOLD='\033[1m'; NC='\033[0m'
 
@@ -25,7 +34,11 @@ echo -e "${BOLD} Quarantine Run Summary: $(basename "$GAMEDIR")${NC}"
 echo -e "${BOLD}========================================${NC}"
 echo
 
-if [ "$ALERT_COUNT" -eq 0 ] && [ "$WARN_COUNT" -eq 0 ]; then
+if [ "$LEAK_COUNT" -gt 0 ]; then
+  echo -e "${RED}${BOLD}VERDICT: SANDBOX LEAK${NC} — the jail exposed $LEAK_COUNT thing(s) to the game."
+elif [ "$GAME_RC" -eq 97 ]; then
+  echo -e "${RED}${BOLD}VERDICT: LAUNCH BLOCKED${NC} — preflight check failed, the game never ran."
+elif [ "$ALERT_COUNT" -eq 0 ] && [ "$WARN_COUNT" -eq 0 ]; then
   echo -e "${GRN}${BOLD}VERDICT: CLEAN${NC} — no suspicious activity detected."
 elif [ "$ALERT_COUNT" -eq 0 ]; then
   echo -e "${YEL}${BOLD}VERDICT: OK, minor notes${NC} — no alerts, $WARN_COUNT informational warning(s)."
@@ -33,6 +46,12 @@ else
   echo -e "${RED}${BOLD}VERDICT: REVIEW NEEDED${NC} — $ALERT_COUNT alert(s) flagged."
 fi
 echo
+
+if [ "$LEAK_COUNT" -gt 0 ]; then
+  echo -e "${RED}--- Sandbox leaks ---${NC}"
+  printf '%s\n' "$LEAKS" | sed 's/^/  /'
+  echo
+fi
 
 if [ "$ALERT_COUNT" -gt 0 ]; then
   echo -e "${RED}--- Alerts ---${NC}"

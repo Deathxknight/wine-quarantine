@@ -179,7 +179,11 @@ apply_game_profile() {
         case "$a" in
             --net=*|--netfilter=*|--netfilter6=*|--private|--private-tmp|--nonewprivs|--caps.drop=*|\
             --nodbus|--seccomp.drop=*|--noroot|--nosound|--nou2f|--novideo|--notv|\
-            --nodvd|--x11=*|--xephyr-screen=*|--trace|--trace=*) ;;
+            --nodvd|--x11=*|--xephyr-screen=*|--trace|--trace=*|\
+            --nogroups|--private-dev|--noinput|--restrict-namespaces|\
+            --blacklist=/run/docker.sock|--blacklist=/var/run/docker.sock|\
+            --blacklist=/run/libvirt|--blacklist=/var/run/libvirt|\
+            --blacklist=/run/podman|--blacklist=/run/user/*/podman) ;;
             *) keep+=("$a") ;;
         esac
     done
@@ -196,6 +200,25 @@ apply_game_profile() {
     if _wq_on "$gd" FJ_NOVIDEO      0; then add+=(--novideo); fi
     if _wq_on "$gd" FJ_NOTV         0; then add+=(--notv); fi
     if _wq_on "$gd" FJ_NODVD        0; then add+=(--nodvd); fi
+
+    # --noprofile (see config.sh) turns off firejail's default hardening, so these
+    # have to be asked for explicitly. Default ON; set the key to 0 to opt out.
+    #  NOGROUPS      drop docker/input/libvirt/wheel/... supplementary groups
+    #  PRIVATE_DEV   minimal /dev instead of the host's
+    #  NOINPUT       hide /dev/input/* (raw keyboard reads); gamepads need this at 0
+    #  BLOCK_SOCKETS hide docker/libvirt/podman control sockets
+    #  RESTRICT_NS   deny new user/mount/etc namespaces. Proton's pressure-vessel
+    #                needs user namespaces, so this defaults to ON only for native.
+    if _wq_on "$gd" FJ_NOGROUPS      1; then add+=(--nogroups);     else skip+=(groups); fi
+    if _wq_on "$gd" FJ_PRIVATE_DEV   1; then add+=(--private-dev);  else skip+=(privdev); fi
+    if _wq_on "$gd" FJ_NOINPUT       1; then add+=(--noinput);      else skip+=(input); fi
+    if _wq_on "$gd" FJ_BLOCK_SOCKETS 1; then
+        add+=(--blacklist=/run/docker.sock --blacklist=/var/run/docker.sock
+              --blacklist=/run/libvirt --blacklist=/var/run/libvirt
+              --blacklist=/run/podman "--blacklist=/run/user/$(id -u)/podman")
+    else skip+=(sockets); fi
+    _wq_ns_default=0; [ "${WQ_RUNNER:-}" = native ] && _wq_ns_default=1
+    if _wq_on "$gd" FJ_RESTRICT_NS "$_wq_ns_default"; then add+=(--restrict-namespaces); else skip+=(ns); fi
 
     # --- network -----------------------------------------------------------
     mode=off
