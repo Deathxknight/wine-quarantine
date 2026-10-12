@@ -59,7 +59,12 @@ If you think a file is real malware, use a VM or don't run it.
 - For the app: `PySide6`. For the private X server: `Xephyr`.
 - For Windows games: [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) (`umu-run`) and a Proton build in Steam's `compatibilitytools.d` (Proton-GE works)
 - `unzip`, `unrar`, `7z` or `tar` if you want to use archives
-- For live connection logging in the Network tab: `journalctl` and `net.netfilter.nf_log_all_netns=1`
+- For live connection logging in the Network tab: `journalctl` (your user must be allowed to read the kernel log, i.e. in `systemd-journal`, `adm` or `wheel`) and `net.netfilter.nf_log_all_netns=1`. `install.sh` offers to set the sysctl for you. Without it the Network tab stays empty even though connections are being made. To do it by hand:
+
+  ```bash
+  sudo sysctl -w net.netfilter.nf_log_all_netns=1
+  echo 'net.netfilter.nf_log_all_netns = 1' | sudo tee /etc/sysctl.d/99-wq.conf
+  ```
 
 ## Setup
 

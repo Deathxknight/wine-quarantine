@@ -216,7 +216,39 @@ DESK
   ok "menu entry added"
 fi
 
-# --- 6. final check ----------------------------------------------------------
+# --- 6. network logging ------------------------------------------------------
+# The sandbox runs in its own network namespace, and the kernel only writes
+# netfilter LOG lines from namespaces other than the host's when
+# net.netfilter.nf_log_all_netns=1. Without it the Network tab stays empty even
+# though connections are being made. Opt-in: it is a system-wide setting, and it
+# also lets other containers/namespaces write into the host kernel log.
+echo; echo "Network logging (Network tab)"
+NFKEY=/proc/sys/net/netfilter/nf_log_all_netns
+if [ "$(cat "$NFKEY" 2>/dev/null)" = 1 ]; then
+  ok "net.netfilter.nf_log_all_netns = 1"
+else
+  warn "net.netfilter.nf_log_all_netns is not 1, so the Network tab cannot show connection attempts"
+  echo "    (the connection filter itself works either way; only the live log is affected)"
+  if ask "  Enable it now and keep it across reboots (needs sudo)?"; then
+    # the logger module has to be loaded for the sysctl to exist; on older kernels
+    # it has another name, so a failed modprobe is not fatal
+    if sudo modprobe nf_log_syslog 2>/dev/null; then
+      printf '%s\n' nf_log_syslog | sudo tee /etc/modules-load.d/wq.conf >/dev/null
+    fi
+    if printf '%s\n' 'net.netfilter.nf_log_all_netns = 1' | sudo tee /etc/sysctl.d/99-wq.conf >/dev/null \
+       && sudo sysctl -q -w net.netfilter.nf_log_all_netns=1; then
+      ok "enabled (saved in /etc/sysctl.d/99-wq.conf)"
+    else
+      bad "could not enable it. Run by hand: sudo sysctl -w net.netfilter.nf_log_all_netns=1"
+    fi
+  else
+    echo "    Later, by hand:"
+    echo "      sudo sysctl -w net.netfilter.nf_log_all_netns=1"
+    echo "      echo 'net.netfilter.nf_log_all_netns = 1' | sudo tee /etc/sysctl.d/99-wq.conf"
+  fi
+fi
+
+# --- 7. final check ----------------------------------------------------------
 echo; echo "Final check"
 if bash -c 'cd "$1" && source ./config.sh && check_deps' _ "$QROOT"; then
   ok "all dependencies satisfied"
