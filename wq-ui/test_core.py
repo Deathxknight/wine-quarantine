@@ -142,4 +142,56 @@ assert c.dir_size(rq/"Real")[0] == 2048 and c.dir_size(rq/"Real", max_entries=1)
 assert c.human_size(500) == "500 B" and c.human_size(1536) == "1.5 KB" and c.human_size(3*1024**3) == "3.0 GB"
 print("game removal checks: ok")
 
+# --- limits, extra firejail options
+import subprocess
+here = Path(__file__).resolve().parent
+assert c.valid_tasks("4096") and not any(c.valid_tasks(x) for x in ("", "0", "-1", "abc", "10 20", "1e3", "4096\n"))
+assert c.valid_memory("8G") and c.valid_memory("512M") and c.valid_memory("1000")
+assert not any(c.valid_memory(x) for x in ("", "0", "8GB", "G", "8 G", "-8G", "8g"))
+assert c.valid_syscalls("bpf") and c.valid_syscalls("ptrace,process_vm_readv,@mount")
+assert not any(c.valid_syscalls(x) for x in ("", "bpf,", ",bpf", "bpf;reboot", "a b", "a,,b"))
+print("limit validators: ok")
+
+# profile.sh is the authority: run the same corpus through it and through wq_core and demand agreement
+corpus = [
+    "--machine-id", "--nosound", "--novideo", "--nou2f", "--notv", "--nodvd", "--noroot",
+    "--rlimit-nofile=4096", "--rlimit-fsize=2000000000", "--rlimit-cpu=3600", "--rlimit-as=8G", "--rlimit-sigpending=100",
+    "--rlimit-nproc=99999", "--timeout=02:00:00", "--timeout=100:59:59", "--nice=0", "--nice=19", "--cpu=0", "--cpu=0,1,2",
+    "--rmenv=DISPLAY", "--blacklist=/mnt/secret", "--noexec=/tmp", "--read-only=/opt/x", "--blacklist=/",
+    "--blacklist=/a/b..c", "--blacklist=/a/..b/c",
+    # must be refused
+    "", "--net=eth0", "--net=none", "--noprofile", "--ignore=nonewprivs", "--whitelist=/home", "--netfilter=/x",
+    "--allow-debuggers", "--seccomp.drop=keyctl", "--private-etc=a", "--shell=none", "--join=1", "--overlay",
+    "--blacklist=/a/../b", "--blacklist=/..", "--blacklist=/a/..", "--blacklist=rel/path", "--blacklist=/a b",
+    "--blacklist=$HOME", "--blacklist=/a;b", "--noexec=", "--timeout=99", "--timeout=1:2:3", "--timeout=02:60:00",
+    "--nice=-1", "--nice=20", "--nice=5x", "--cpu=", "--cpu=a", "--rmenv=1BAD", "--rmenv=A-B", "--rlimit-nofile=",
+    "--rlimit-nofile=-1", "--rlimit-bogus=1", "--rlimit-as=8T", "--machine-id=1", "--nosound ", " --nosound", "nosound",
+    "--rlimit-nofile=1" + "0" * 19,
+]
+for line in corpus:
+    sh = subprocess.run(["bash", "-c", '. "$1/profile.sh"; _wq_extra_arg_ok "$2"', "_", str(here), line]).returncode == 0
+    py = c.check_extra_arg(line) == ""
+    if line == "":
+        continue            # blank lines are dropped before either check runs
+    assert sh == py, f"shell and python disagree on {line!r}: shell={sh} python={py}"
+accepted = [x for x in corpus if x and c.check_extra_arg(x) == ""]
+assert 25 <= len(accepted) < len(corpus) - 10, len(accepted)
+print(f"extra-option allow-list: shell and python agree on {len(corpus) - 1} inputs ({len(accepted)} accepted)")
+
+# effective list: game.conf wins as a whole, and a bare `KEY=` means "none"
+g = c.Game("G", d, {"FJ_EXTRA_ARGS": ["--nosound", "  "]})
+assert g.effective_lines("FJ_EXTRA_ARGS", {"FJ_EXTRA_ARGS": ["--novideo"]}) == ["--nosound"]
+assert c.Game("G", d, {}).effective_lines("FJ_EXTRA_ARGS", {"FJ_EXTRA_ARGS": ["--novideo"]}) == ["--novideo"]
+assert c.Game("G", d, {"FJ_EXTRA_ARGS": [""]}).effective_lines("FJ_EXTRA_ARGS", {"FJ_EXTRA_ARGS": ["--novideo"]}) == []
+ge = d/"extra.conf"; ge.write_text("EXE=a.exe\n")
+c.write_kv(ge, {"FJ_EXTRA_ARGS": [""]})
+assert ge.read_text().splitlines() == ["EXE=a.exe", "FJ_EXTRA_ARGS="] and c.parse_kv(ge)["FJ_EXTRA_ARGS"] == [""]
+c.write_kv(ge, {"FJ_EXTRA_ARGS": ["--timeout=01:00:00", "--nosound"], "FJ_TASKS_MAX": "4096"})
+assert c.parse_kv(ge)["FJ_EXTRA_ARGS"] == ["--timeout=01:00:00", "--nosound"] and c.parse_kv(ge)["FJ_TASKS_MAX"] == ["4096"]
+c.write_kv(ge, {k: None for k in c.MANAGED_SCALARS})
+assert ge.read_text().splitlines() == ["EXE=a.exe"]                    # "Reset to defaults" clears them too
+assert "FJ_MACHINE_ID" in c.ALL_BOOLS and c.ALL_BOOLS["FJ_MACHINE_ID"] is True
+assert set(c.TEXT_KEYS) <= set(c.TEXT_HINTS) and c.EXTRA_ARGS_KEY in c.LIST_KEYS
+print("extra-option storage: ok")
+
 print("\nALL CORE TESTS PASSED")

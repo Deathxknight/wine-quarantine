@@ -52,7 +52,15 @@ def patch_launch(text):
     if i_bl < i_wl:
         sys.exit("unexpected order of WL_ARGS / BL_ARGS in _launch-core.sh")
     extra = ['mapfile -t -O "${#WL_ARGS[@]}" WL_ARGS < <(profile_extra_whitelist_args)  ' + MARK]
-    guard = ['apply_game_profile "$GAMEDIR"  ' + MARK]
+    guard = ['WQ_LIMITS_SUPPORTED=1  ' + MARK + ': both firejail calls below use WQ_LIMIT_PREFIX',
+             'apply_game_profile "$GAMEDIR"  ' + MARK]
+    # both firejail launches (prefix bootstrap + monitored run) go inside the cgroup scope
+    envs = [i for i, l in enumerate(lines) if l.strip().startswith("env -u DBUS_SESSION_BUS_ADDRESS")]
+    if len(envs) != 2:
+        sys.exit(f"anchor problem: expected 2 firejail launches in _launch-core.sh, found {len(envs)}. "
+                 "The repo has probably changed; nothing was modified.")
+    for i in envs:
+        lines[i] = lines[i].replace("env -u", '${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u', 1)
     # insert later one first so indexes stay valid
     lines[i_bl + 1:i_bl + 1] = extra
     lines[i_wl:i_wl] = guard

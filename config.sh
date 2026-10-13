@@ -46,7 +46,7 @@ LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 declare -p HOME_BLACKLIST >/dev/null 2>&1 || HOME_BLACKLIST=()
 declare -p BLACKLIST_PATHS >/dev/null 2>&1 || BLACKLIST_PATHS=()
 
-: "${SECCOMP_DROP:=add_key,request_key,keyctl,init_module,finit_module,delete_module,kexec_load,kexec_file_load,reboot,swapon,swapoff,acct,quotactl,open_by_handle_at,perf_event_open,userfaultfd,io_uring_setup,io_uring_enter,io_uring_register}"
+: "${SECCOMP_DROP:=add_key,request_key,keyctl,init_module,finit_module,delete_module,kexec_load,kexec_file_load,reboot,swapon,swapoff,acct,quotactl,open_by_handle_at,perf_event_open,userfaultfd,io_uring_setup,io_uring_enter,io_uring_register,bpf}"
 
 declare -p QUARANTINE_FIREJAIL_ARGS >/dev/null 2>&1 || QUARANTINE_FIREJAIL_ARGS=(
   --noprofile

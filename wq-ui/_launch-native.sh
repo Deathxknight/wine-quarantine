@@ -50,6 +50,7 @@ find "$LOGDIR" -maxdepth 1 -type f \( -name 'alerts-*.log' -o -name 'launch-*.lo
 echo "wq: native launch of $GAMENAME ($EXE). verify-sandbox.sh is not run for native games."
 
 export WQ_RUNNER=native
+WQ_LIMITS_SUPPORTED=1   # the firejail call below uses WQ_LIMIT_PREFIX
 apply_game_profile "$GAMEDIR"
 
 # private home that persists, instead of firejail's throwaway one
@@ -71,7 +72,7 @@ mapfile -t BL_ARGS < <(build_blacklist_args)
 export WQ_EXE_NAME="$EXE_NAME"
 cd "$EXEDIR"
 
-env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
+${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
   firejail "${FJ_ARGS[@]}" "${WL_ARGS[@]}" "${BL_ARGS[@]}" -- \
     bash -c '
       # preflight: refuse to start the game if the jail is leaking (honours the
@@ -90,6 +91,12 @@ env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
       if has sockets; then
         for s in /run/docker.sock /var/run/docker.sock /run/libvirt/libvirt-sock; do
           [ -S "$s" ] && leak "control socket visible: $s"
+        done
+      fi
+      if has sockets && [ "${QVERIFY_NET:-off}" != open ]; then
+        # these answer name lookups without any network interface, so --net=none does not cover them
+        for s in /run/systemd/resolve/io.systemd.Resolve /run/nscd/socket /var/run/nscd/socket; do
+          [ -S "$s" ] && leak "DNS resolver socket visible (bypasses --net=none): $s"
         done
       fi
       if has input; then

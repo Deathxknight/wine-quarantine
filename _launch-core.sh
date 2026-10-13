@@ -69,6 +69,7 @@ mkdir -p "$GAMEDIR/prefix"
 PREFIX_FRESH=0
 [ ! -f "$GAMEDIR/prefix/system.reg" ] && PREFIX_FRESH=1
 
+WQ_LIMITS_SUPPORTED=1  # wq-ui integration: both firejail calls below use WQ_LIMIT_PREFIX
 apply_game_profile "$GAMEDIR"  # wq-ui integration
 mapfile -t WL_ARGS < <(build_whitelist_args "$GAMEDIR" "$UMU_DATA")
 mapfile -t BL_ARGS < <(build_blacklist_args)
@@ -90,7 +91,7 @@ if [ "$PREFIX_FRESH" -eq 1 ]; then
   BOOTSTRAP_BAT="$GAMEDIR/game/_bootstrap.bat"
   printf '@echo off\r\nexit /b 0\r\n' > "$BOOTSTRAP_BAT"
 
-  env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
+  ${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
     firejail "${QUARANTINE_FIREJAIL_ARGS[@]}" "${WL_ARGS[@]}" "${BL_ARGS[@]}" -- \
       timeout 120 python3 "$LUTRIS_UMU" "./_bootstrap.bat" \
       >"$LOGDIR/bootstrap.log" 2>&1 || true
@@ -113,7 +114,7 @@ cd "$EXEDIR"
 
 "$QROOT/reg-diff.sh" snapshot "$GAMEDIR"
 
-env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
+${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
   firejail "${QUARANTINE_FIREJAIL_ARGS[@]}" "${WL_ARGS[@]}" "${BL_ARGS[@]}" -- \
     bash -c '
       "$0/verify-sandbox.sh" || exit $?

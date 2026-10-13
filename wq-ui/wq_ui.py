@@ -453,6 +453,7 @@ class MainWindow(QMainWindow):
 
         self.boxes: dict[str, TriBox] = {}
         self.texts: dict[str, QComboBox] = {}
+        self.plains: dict[str, QPlainTextEdit] = {}       # multi-line list keys edited as text (FJ_EXTRA_ARGS)
         self.orig_boxes: dict[str, Qt.CheckState] = {}    # as loaded, so undoing an edit isn't a change
         self.orig_texts: dict[str, str] = {}
         self.hook_edits: dict[str, QLineEdit] = {}
@@ -669,6 +670,61 @@ class MainWindow(QMainWindow):
         self.dev_note = label("", "muted")
         gl_dev.addWidget(self.dev_note)
 
+        # resource limits + free-form options
+        g = QGroupBox("Limits and extra options")
+        gl = QVBoxLayout(g)
+        gl.addWidget(label("Fork-bomb and memory protection. The launch runs inside a systemd cgroup scope, so the limit "
+                           "counts only this game's processes (firejail, Wine and the game). Needs a systemd user "
+                           "session; if it is not available the launch is cancelled instead of running unlimited.",
+                           name="hint"))
+        for key, text, tip, presets in (
+            ("FJ_TASKS_MAX", "Max processes and threads",
+             "cgroup TasksMax. A fork bomb stops at this number instead of freezing the desktop. Wine/Proton games "
+             "use a few hundred to ~1500 threads, so 4096 is a safe start.",
+             [("No limit", ""), ("2048", "2048"), ("4096", "4096"), ("8192", "8192")]),
+            ("FJ_MEMORY_MAX", "Max memory",
+             "cgroup MemoryMax. The game is slowed and then killed past this instead of pushing your desktop into swap.",
+             [("No limit", ""), ("2G", "2G"), ("4G", "4G"), ("8G", "8G"), ("16G", "16G")]),
+            ("FJ_SECCOMP_EXTRA", "Extra blocked syscalls",
+             "Added to the seccomp drop list in config.sh (SECCOMP_DROP). Only takes effect with the seccomp filter on. "
+             "Some games and anti-cheat need ptrace; test before relying on it.",
+             [("None", ""), ("ptrace + cross-process memory", "ptrace,process_vm_readv,process_vm_writev"),
+              ("mount family", "mount,umount2,pivot_root")]),
+        ):
+            row = QHBoxLayout()
+            lab = QLabel(text)
+            lab.setMinimumWidth(170)
+            row.addWidget(lab)
+            c = QComboBox()
+            c.setEditable(True)
+            c.setMinimumWidth(180)
+            for t, val in presets:
+                c.addItem(t, val)
+            c.lineEdit().setPlaceholderText(core.TEXT_HINTS[key])
+            c.setToolTip(tip)
+            c.editTextChanged.connect(lambda *_, k=key: self._text_edited(k))
+            self.texts[key] = c
+            row.addWidget(c, 1)
+            gl.addLayout(row)
+        gl.addWidget(label("Extra firejail options (one per line)", name="hint"))
+        self.extra_edit = QPlainTextEdit()
+        self.extra_edit.setMaximumHeight(104)
+        self.extra_edit.setPlaceholderText("--timeout=02:00:00\n--rlimit-fsize=2000000000\n--blacklist=/mnt/private")
+        self.extra_edit.setToolTip(
+            "Only options that make the sandbox tighter are accepted:\n"
+            "  --rlimit-nofile|fsize|cpu|as|sigpending=N   --timeout=hh:mm:ss   --nice=0..19   --cpu=0,1\n"
+            "  --blacklist=/path   --noexec=/path   --read-only=/path   --rmenv=NAME\n"
+            "  --machine-id --nosound --novideo --nou2f --notv --nodvd --noroot\n"
+            "Anything else (--net, --whitelist, --ignore, ...) cancels the launch.\n"
+            "Not --rlimit-nproc as a fork-bomb limit: it counts every process of your user. Use Max processes above.")
+        self.extra_edit.textChanged.connect(lambda: self._text_edited("FJ_EXTRA_ARGS"))
+        self.extra_edit.textChanged.connect(self.refresh_dependents)
+        self.plains["FJ_EXTRA_ARGS"] = self.extra_edit
+        gl.addWidget(self.extra_edit)
+        self.extra_note = label("", "warn")
+        gl.addWidget(self.extra_note)
+        v.addWidget(g)
+
         # network
         g = QGroupBox("Network")
         gl = QVBoxLayout(g)
@@ -769,7 +825,12 @@ class MainWindow(QMainWindow):
         if not self._loading:
             self._mark(key)
 
+    def extra_lines(self) -> list[str]:
+        return [ln.strip() for ln in self.extra_edit.toPlainText().splitlines() if ln.strip()]
+
     def text_value(self, key: str) -> str:
+        if key in self.plains:
+            return "\n".join(self.extra_lines())
         c = self.texts[key]
         txt = c.currentText().strip()
         i = c.currentIndex()
@@ -1099,13 +1160,21 @@ class MainWindow(QMainWindow):
                 else:
                     combo.setCurrentIndex(-1)
                     combo.setEditText(v)
-                le.setPlaceholderText("e.g. enp5s0 or br0" if key == "FJ_NET_IFACE" else "WIDTHxHEIGHT")
+                le.setPlaceholderText(core.TEXT_HINTS[key])
             else:
                 combo.setCurrentIndex(-1)
                 combo.setEditText("")
                 le.setPlaceholderText("(differs between selected games)")
+        for key, edit in self.plains.items():
+            vals = {tuple(g.effective_lines(key, self.defaults)) for g in sel}
+            if len(vals) > 1:
+                edit.setPlainText("")
+                edit.setPlaceholderText("(differs between selected games)")
+            else:
+                edit.setPlainText("\n".join(next(iter(vals), ())))
+                edit.setPlaceholderText("--timeout=02:00:00\n--rlimit-fsize=2000000000\n--blacklist=/mnt/private")
         self.orig_boxes = {k: b.checkState() for k, b in self.boxes.items()}
-        self.orig_texts = {k: self.text_value(k) for k in self.texts}
+        self.orig_texts = {k: self.text_value(k) for k in (*self.texts, *self.plains)}
         self._loading = False
         if len(sel) == 0:
             self.sel_banner.setText("Select one or more games.")
@@ -1143,6 +1212,18 @@ class MainWindow(QMainWindow):
         self.x_note.setText(xm)
         self.x_note.setVisible(bool(xm) and x)
 
+        em = ""
+        for ln in self.extra_lines():
+            why = core.check_extra_arg(ln)
+            if why:
+                em = f"“{ln}”: {why}. The launch will be cancelled until this is fixed."
+                break
+            if ln.startswith("--rlimit-nproc="):
+                em = ("--rlimit-nproc counts every process of your user, not just the game, so a low value stops the "
+                      "game from starting. Use “Max processes and threads” instead.")
+        self.extra_note.setText(em)
+        self.extra_note.setVisible(bool(em))
+
     def update_apply_bar(self):
         n = len(self.loaded)
         pend = self.pending_count()
@@ -1164,7 +1245,17 @@ class MainWindow(QMainWindow):
             elif key in self.texts:
                 v = self.text_value(key)
                 ch[key] = v or None
+            elif key in self.plains:
+                ch[key] = self._extra_for_write()
         return ch
+
+    def _extra_for_write(self) -> list[str] | None:
+        """Lines to store. With nothing typed, a bare `FJ_EXTRA_ARGS=` is written when the
+        default profile has options, so "none" does not silently fall back to them."""
+        lines = self.extra_lines()
+        if lines:
+            return lines
+        return [""] if any(x.strip() for x in self.defaults.get("FJ_EXTRA_ARGS", [])) else None
 
     def validate(self, ch: dict) -> str:
         s = ch.get("FJ_XEPHYR_SIZE")
@@ -1173,6 +1264,16 @@ class MainWindow(QMainWindow):
         i = ch.get("FJ_NET_IFACE")
         if i and not all(c.isalnum() or c in "_.-" for c in i):
             return f"“{i}” is not a valid interface name."
+        for k, ok, hint in (("FJ_TASKS_MAX", core.valid_tasks, "a whole number such as 4096"),
+                            ("FJ_MEMORY_MAX", core.valid_memory, "a number with optional K, M, G or T, such as 8G"),
+                            ("FJ_SECCOMP_EXTRA", core.valid_syscalls, "syscall names separated by commas")):
+            v = ch.get(k)
+            if v and not ok(v):
+                return f"“{v}” is not valid here. Use {hint}."
+        for ln in ch.get("FJ_EXTRA_ARGS") or []:
+            why = core.check_extra_arg(ln)
+            if why:
+                return f"Extra firejail option “{ln}”: {why}."
         return ""
 
     def apply_changes(self, quiet: bool = False) -> bool:
@@ -1245,7 +1346,7 @@ class MainWindow(QMainWindow):
     def save_as_defaults(self):
         if not self.loaded_games():
             return
-        err = self.validate({k: self.text_value(k) for k in self.texts})
+        err = self.validate({**{k: self.text_value(k) for k in self.texts}, "FJ_EXTRA_ARGS": self.extra_lines()})
         if err:
             QMessageBox.warning(self, "Cannot save", err)
             return
@@ -1256,6 +1357,7 @@ class MainWindow(QMainWindow):
         for key in self.texts:
             v = self.text_value(key)
             upd[key] = v or None
+        upd["FJ_EXTRA_ARGS"] = self.extra_lines() or None
         if upd.get("FJ_NET_OPEN") == "1":
             r = QMessageBox.warning(self, "Unrestricted network by default",
                                     "Every game without its own setting would get unfiltered network access. Continue?",

@@ -33,6 +33,7 @@ BOOL_OPTS: list[BoolOpt] = [
     BoolOpt("FJ_NODBUS", "Block D-Bus", True, "--nodbus", "isolation"),
     BoolOpt("FJ_SECCOMP", "Seccomp syscall filter", True, "--seccomp.drop=... (list lives in config.sh: SECCOMP_DROP)", "isolation"),
     BoolOpt("FJ_NOROOT", "No root user namespace", False, "--noroot: user namespace with only the current user mapped.", "isolation"),
+    BoolOpt("FJ_MACHINE_ID", "Spoof machine-id", True, "--machine-id: the game sees a random /etc/machine-id instead of the stable ID of this PC.", "isolation"),
     BoolOpt("FJ_NOSOUND", "Block audio", False, "--nosound", "devices"),
     BoolOpt("FJ_NOVIDEO", "Block webcams", False, "--novideo", "devices"),
     BoolOpt("FJ_NOU2F", "Block U2F / security keys", False, "--nou2f", "devices"),
@@ -50,9 +51,19 @@ NET_BOOLS: dict[str, bool] = {
     "FJ_XEPHYR": False,
 }
 ALL_BOOLS: dict[str, bool] = {**{o.key: o.default for o in BOOL_OPTS}, **NET_BOOLS}
-TEXT_KEYS = {"FJ_NET_IFACE": "", "FJ_XEPHYR_SIZE": ""}
-LIST_KEYS = ("FJ_NET_ALLOW", "FJ_WL_RW", "FJ_WL_RO", "FJ_DEV_BLOCK", "FJ_HOOK_PRE", "FJ_HOOK_POST")
-MANAGED_SCALARS = tuple(ALL_BOOLS) + tuple(TEXT_KEYS)
+TEXT_KEYS = {"FJ_NET_IFACE": "", "FJ_XEPHYR_SIZE": "", "FJ_TASKS_MAX": "", "FJ_MEMORY_MAX": "", "FJ_SECCOMP_EXTRA": ""}
+TEXT_HINTS = {
+    "FJ_NET_IFACE": "e.g. enp5s0 or br0",
+    "FJ_XEPHYR_SIZE": "WIDTHxHEIGHT",
+    "FJ_TASKS_MAX": "empty = no limit, e.g. 4096",
+    "FJ_MEMORY_MAX": "empty = no limit, e.g. 8G",
+    "FJ_SECCOMP_EXTRA": "extra syscalls, comma separated",
+}
+EXTRA_ARGS_KEY = "FJ_EXTRA_ARGS"      # free-form firejail options, one per line, allow-listed
+LIST_KEYS = ("FJ_NET_ALLOW", "FJ_WL_RW", "FJ_WL_RO", "FJ_DEV_BLOCK", "FJ_HOOK_PRE", "FJ_HOOK_POST", EXTRA_ARGS_KEY)
+# everything "Reset to defaults" clears from game.conf (FJ_EXTRA_ARGS is a list, but it is
+# part of the profile, unlike the whitelists / hooks, which are kept)
+MANAGED_SCALARS = tuple(ALL_BOOLS) + tuple(TEXT_KEYS) + (EXTRA_ARGS_KEY,)
 
 # --------------------------------------------------------------------------
 # KEY=value files (read as data, same as read_game_conf in config.sh)
@@ -164,6 +175,13 @@ class Game:
 
     def flag(self, key: str, defaults: dict[str, list[str]]) -> bool:
         return self.scalar(key, defaults, "1" if ALL_BOOLS[key] else "0") == "1"
+
+    def effective_lines(self, key: str, defaults: dict[str, list[str]]) -> list[str]:
+        """Non-blank values of a list key. If game.conf has the key at all (even as an
+        empty `KEY=` line, which means "none, ignore the defaults") it wins, otherwise
+        the defaults file is used. profile.sh does the same."""
+        src = self.conf if key in self.conf else defaults
+        return [v.strip() for v in src.get(key, []) if v.strip()]
 
     def net_mode(self, defaults: dict[str, list[str]]) -> str:
         if not self.flag("FJ_NET", defaults):
@@ -488,6 +506,55 @@ _SIZE = re.compile(r"^\d{3,5}x\d{3,5}$")
 
 def valid_size(s: str) -> bool:
     return bool(_SIZE.match(s))
+
+
+# --- limits and extra firejail options ---------------------------------------
+# These mirror profile.sh (_wq_extra_arg_ok & co). profile.sh is the authority, it
+# re-checks everything at launch; this copy only lets the UI complain early.
+# test_core.py runs both on the same inputs so they cannot drift apart.
+
+_TASKS = re.compile(r"[1-9][0-9]{0,8}")
+_MEMORY = re.compile(r"[1-9][0-9]{0,9}[KMGT]?")
+_SYSCALLS = re.compile(r"[A-Za-z0-9_@]+(,[A-Za-z0-9_@]+)*")
+
+
+def valid_tasks(s: str) -> bool:
+    return bool(_TASKS.fullmatch(s))
+
+
+def valid_memory(s: str) -> bool:
+    return bool(_MEMORY.fullmatch(s))
+
+
+def valid_syscalls(s: str) -> bool:
+    return bool(_SYSCALLS.fullmatch(s))
+
+
+_EXTRA_FLAGS = {"--machine-id", "--nosound", "--novideo", "--nou2f", "--notv", "--nodvd", "--noroot"}
+_EXTRA_RE = [re.compile(r) for r in (
+    r"--rlimit-(nproc|nofile|fsize|cpu|as|sigpending)=[0-9]{1,18}[KMG]?",
+    r"--timeout=[0-9]{1,3}:[0-5][0-9]:[0-5][0-9]",
+    r"--nice=([0-9]|1[0-9])",
+    r"--cpu=[0-9]+(,[0-9]+)*",
+    r"--rmenv=[A-Za-z_][A-Za-z0-9_]*",
+)]
+_EXTRA_PATH_RE = re.compile(r"--(blacklist|noexec|read-only)=(/[A-Za-z0-9_./@%+:=,-]*)")
+
+
+def check_extra_arg(line: str) -> str:
+    """"" if `line` is an allowed extra firejail option, else a reason. Only options
+    that can make the sandbox tighter are accepted: no --net, --noprofile, --ignore,
+    --allow-*, --netfilter, --whitelist (those have their own switches or none)."""
+    if not line or line.startswith("#"):
+        return ""
+    if line in _EXTRA_FLAGS or any(r.fullmatch(line) for r in _EXTRA_RE):
+        return ""
+    m = _EXTRA_PATH_RE.fullmatch(line)
+    if m:
+        if any(seg == ".." for seg in m.group(2).split("/")):
+            return "paths may not contain .."
+        return ""
+    return "not an allowed option"
 
 
 # --------------------------------------------------------------------------

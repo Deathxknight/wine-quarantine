@@ -90,6 +90,18 @@ NON_LO="${NON_LO# }"
 [ -z "$NON_LO" ] && pass "network namespace contains only lo" \
 || { if [ "${QVERIFY_NET:-off}" != off ]; then pass "network enabled by profile (${QVERIFY_NET}): $NON_LO"; else fail "non-loopback interfaces visible: $NON_LO"; fi; }
 
+# DNS resolver sockets answer lookups without a network interface, so --net=none does not cover them
+if skipped sockets || [ "${QVERIFY_NET:-off}" = open ]; then
+  pass "resolver socket check not applicable (profile)"
+else
+  RES_BAD=""
+  for s in /run/systemd/resolve/io.systemd.Resolve /run/nscd/socket /var/run/nscd/socket; do
+    [ -S "$s" ] && RES_BAD="$RES_BAD $s"
+  done
+  [ -z "$RES_BAD" ] && pass "no DNS resolver socket visible" \
+  || fail "DNS resolver socket visible (bypasses --net=none):$RES_BAD"
+fi
+
 # $HOME should be a fresh tmpfs with at most firejail's shell startup files
 ALLOWED_HOME_ENTRIES=(.inputrc .zshrc .bashrc .Xauthority)  # firejail --private copies this in for X11
 while IFS= read -r wl; do
