@@ -1,112 +1,148 @@
 # wine-quarantine
 
-Scripts and a small Qt app for running games from sources you don't fully trust on Linux. Each game runs in its own [firejail](https://firejail.wordpress.com/) sandbox with no network by default, and a monitor watches for suspicious behaviour.
+I like trying games from itch.io and other such websites . I don't like double-clicking an unknown `.exe` on the machine that holds my files and passwords. So I built a place to put those games first.
 
-I made this for myself because I like trying small indie games and didn't want to double-click unknown files on my main machine. It handles Windows games (through Proton) and native Linux games (shell scripts, binaries, AppImages).
+wine-quarantine runs each game in its own [firejail](https://firejail.wordpress.com/) sandbox, with no network unless you allow it, all while a monitor watches for the kind of behaviour a game has no reason to show. It handles bindows games (through Proton) and native Linux games (shell scripts, binaries, AppImages). A small Qt app ties it together.
 
-<img width="1903" height="1009" alt="image" src="https://github.com/user-attachments/assets/659aa1e9-97cb-449f-8c18-198792502f10" />
+<img width="1903" height="1009" alt="wine-quarantine main window" src="https://github.com/user-attachments/assets/659aa1e9-97cb-449f-8c18-198792502f10" />
 
-## This is not total protection
+## What this is not 
 
-It makes running a sketchy game less risky, not safe.
+It makes running something sketchy _less risky_. It does not make it safe, it is VERY important to understand that first . 
 
 - It's a firejail sandbox, not a VM. The game shares your kernel and runs as your user.
-- The monitor is a tripwire. It matches names and polls every few seconds, so it can miss things.
-- X11 is only isolated when you turn on the private X server (Xephyr) for that game, and audio is never isolated.
-- Online and multiplayer games need network access, which weakens the sandbox. The allow-list helps, but it isn't a guarantee.
+- The monitor is a tripwire. It matches names and polls every few seconds, so a careful piece of malware can slip past it.
+- X11 is only isolated if you turn on the private X server (Xephyr) for that game. 
+- Multiplayer games need the network, and that weakens the sandbox. The allow-list helps, but it isn't a guarantee.
+- The cybersecurity space is ever evolving - this is the best i can do alone.
 
-If you think a file is real malware, use a VM or don't run it.
+If you think a file is real malware, use a VM, or don't run it.
 
-## Features
+## How it works
+
+**It checks itself before every run.** Before the game starts, `verify-sandbox.sh` runs _inside_ the jail and looks at the facts: capabilities dropped, no-new-privileges set, seccomp filter active, only a loopback interface, no DNS resolver socket reachable, your real `$HOME` not visible, no D-Bus or SSH agent leaking in. If any check fails, the game doesn't start. The script also hashes itself, so a tampered copy refuses to run.
+
+**It watches while the game runs.** The monitor follows the game's process tree and the files it touches. It raises an alert for things like a script or executable dropped in a Startup folder, writes to `system32`, a registry hive changing at runtime, or a game spawning `powershell`, `certutil`, `curl` or `rundll32`. **The first alert stops the sandbox** and opens a terminal with the log. For Windows games it also snapshots the registry before the run and diffs it afterwards, looking for persistence keys such as `Run`, services and `AppInit_DLLs`.
+
+**Every run ends with a verdict.** `CLEAN`, `OK, minor notes`, `REVIEW NEEDED`, `LAUNCH BLOCKED` (a preflight check failed and the game never ran) or `SANDBOX LEAK` (the jail exposed something it shouldn't have). Logs are kept per game and pruned after 30 days.
+
+**The defaults lean strict.** No network, a private `$HOME` and `/tmp`, all capabilities dropped, no D-Bus, a seccomp filter that blocks things like `bpf`, `io_uring` and `keyctl`, and a random machine ID so a game can't fingerprint you. Name lookups are closed off too: `--net=none` alone doesn't stop a game leaking data through the systemd-resolved or nscd sockets, so those are hidden as well.
+
+## What you can do with it
 
 **Sandboxing**
-* One firejail profile per game, plus a shared default profile you can save and reset to.
-* Isolation switches: hide your home directory, private `/tmp`, no new privileges, drop all capabilities, block D-Bus, seccomp syscall filter, no root user namespace.
-* Device switches: block audio, webcams, U2F/security keys, TV/DVB devices and optical drives. Power users can also hide individual `/dev` nodes per game.
-* Only the game's own folder is writable. Extra read-write or read-only folders and files can be whitelisted per game.
-* Optional private X server (Xephyr, with a configurable window size). With it on, the host X display and the Wayland socket are hidden from the game.
+
+- One firejail profile per game, plus a shared default you can save and reset to.
+- Switches for isolation (hide your home folder, private `/tmp`, no new privileges, drop capabilities, block D-Bus, seccomp, no root namespace) and for devices (audio, webcams, security keys, TV tuners, optical drives, or any single `/dev` node).
+- Only the game's own folder is writable. You can whitelist extra read-write or read-only paths per game.
+- Optional private X server (Xephyr, any window size). With it on, the game can't see your host display or Wayland socket.
+- Resource limits: a cap on processes and threads (fork-bomb protection) and a memory cap, enforced through systemd. If a limit is set and can't be applied, the launch is cancelled rather than run unlimited.
+- An extra-options box that only accepts options that make the sandbox _tighter_. Anything that would loosen it, like `--net` or `--whitelist`, is refused, not quietly skipped.
 
 **Network**
-* Off by default.
-* Filtered mode with an allow-list of hosts and ports, a chosen interface, and optional DNS.
-* Connection logging and a learn mode that allows everything and records it, so you can build an allow-list from what the game actually does.
-* A Network tab showing connection attempts live from the kernel firewall log.
+
+- Off by default.
+- Filtered mode with an allow-list of hosts and ports, a chosen interface, and optional DNS.
+- Learn mode lets everything through and records it, so you can build an allow-list from what the game really does.
+- A live Network tab shows connection attempts as the kernel firewall sees them.
 
 **Games**
-* Windows games run through [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) and Proton, each with its own Wine prefix.
-* Native Linux games run from a shell script, binary or AppImage, with a persistent private `$HOME` so saves survive.
-* Add a game from a folder, an archive (`.zip`, `.rar`, `.7z`, `.tar.*`) or a single file.
-* If several start files are found you pick the right one. You can change it later.
-* Remove a game from the app. The folder goes to the Trash, or is deleted permanently only after you type its name.
-* Optional shell scripts that run before launch or after exit (on your machine, not in the sandbox).
 
-**Monitoring**
-* A monitor runs alongside every game and writes an alert log.
-* Each run ends with a summary and a verdict.
-* Logs are kept per game and pruned after 30 days.
+- Windows games run through [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) and Proton, each with its own Wine prefix.
+- Native Linux games keep a private `$HOME` so saves survive between runs.
+- Add a game from a folder, an archive (`.zip`, `.rar`, `.7z`, `.tar.*`) or a single file. If there are several start files you choose one, and you can change it later.
+- Remove a game from the app. The folder goes to the Trash, and is deleted for good only if you type its name.
+- Optional scripts that run before launch or after exit, on your machine and outside the sandbox.
 
-**The app (wq-ui)**
-* Game list with location, network, display and state at a glance. Select several games to change them together.
-* Tri-state checkboxes show when selected games disagree. Only real changes count as unapplied, and the app asks before you lose any.
-* One Add menu for new games, the start file, launch scripts and hidden devices. Right-click a game for more.
-* Light, dark or follow-system themes, plus your own CSS that reloads when the file changes.
-* A Debug window that checks dependencies and builds a redacted report for bug reports.
-* Core logic and the profile script have their own tests.
+**The app**
 
-## Requirements
+- The game list shows location, network, display and state at a glance. Select several games to change them together.
+- Tri-state checkboxes show where selected games disagree. Only real changes count as unsaved, and the app asks before you lose any.
+- One **Add** menu for new games, the start file, launch scripts and hidden devices. Right-click a game for more.
+- Light, dark or follow-system themes, plus your own CSS that reloads when you save it.
+- A Debug window that checks dependencies and builds a redacted report you can paste into a bug report.
 
-- `firejail`, `inotify-tools`, `python3`
-- For the app: `PySide6`. For the private X server: `Xephyr`.
-- For Windows games: [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) (`umu-run`) and a Proton build in Steam's `compatibilitytools.d` (Proton-GE works)
-- `unzip`, `unrar`, `7z` or `tar` if you want to use archives
-- For live connection logging in the Network tab: `journalctl` (your user must be allowed to read the kernel log, i.e. in `systemd-journal`, `adm` or `wheel`) and `net.netfilter.nf_log_all_netns=1`. `install.sh` offers to set the sysctl for you. Without it the Network tab stays empty even though connections are being made. To do it by hand:
+## Getting started
 
-  ```bash
-  sudo sysctl -w net.netfilter.nf_log_all_netns=1
-  echo 'net.netfilter.nf_log_all_netns = 1' | sudo tee /etc/sysctl.d/99-wq.conf
-  ```
+**Put it outside your home folder.** firejail's private mode hides `$HOME` from the game, and that includes this project. `install.sh` will offer to move it to `/mnt/wine-quarantine` for you.
 
-## Setup
+bash
 
-The scripts look for Steam in `~/.local/share/Steam` and for `umu-run` on your PATH or in Lutris's runtime folder. If yours live somewhere else, create a file called `config.local.sh` next to `config.sh`:
+```bash
+git clone https://github.com/Deathxknight/wine-quarantine
+cd wine-quarantine
+./install.sh
+./wq
+```
+
+`install.sh` is safe to re-run. It checks for what's missing (and offers to install it with pacman, apt or dnf), can download GE-Proton and the umu runtime for you, wires in the app, creates the `./wq` launcher and an optional menu entry, and offers to turn on the kernel setting the Network tab needs
+( Ive tried to test cross distro installs , if you have any issues let me know )
+
+**What it needs:** `firejail`, `inotify-tools`, `python3`, and `PySide6` for the app. Optional: `Xephyr` for the private X server, `unzip`/`unrar`/`7z` for archives, and `journalctl` access (a member of `systemd-journal`, `adm` or `wheel`) for live connection logging. Windows games also need `umu-run` and a Proton build.
+
+**Live connection logging** also needs `net.netfilter.nf_log_all_netns=1`, which `install.sh` offers to set. Without it the Network tab stays empty even though connections are happening. To do it by hand:
+
+bash
+
+```bash
+sudo sysctl -w net.netfilter.nf_log_all_netns=1
+echo 'net.netfilter.nf_log_all_netns = 1' | sudo tee /etc/sysctl.d/99-wq.conf
+```
+
+If Steam or `umu-run` live somewhere unusual, create `config.local.sh` next to `config.sh`:
+
+bash
 
 ```bash
 STEAM_ROOT="/path/to/Steam"
 LUTRIS_UMU="/path/to/umu-run"
 ```
 
-To use the app, wire it into the scripts once, then start it:
+## Everyday use
+
+In the app: **Add > New game…**, choose Windows or Native Linux, name it, pick a source, then **Launch**.
+
+Or from the command line:
+
+bash
 
 ```bash
-python3 wq-ui/integrate.py      # add --dry-run to preview, --revert to undo
-python3 wq-ui/wq_ui.py
-```
-
-If you edit `verify-sandbox.sh` by hand, regenerate its hash with `./verify-sandbox.sh --update-hash`.
-
-## Usage
-
-From the app: **Add > New game…**, pick Windows or Native Linux, name it, choose a source, then **Launch**.
-
-From the command line:
-
-```bash
-./new-quarantine.sh "My Game" ~/Downloads/mygame.zip          # Windows game
+./new-quarantine.sh "My Game" ~/Downloads/mygame.zip            # Windows game
 ./wq-ui/new-native.sh "My Native Game" ~/Downloads/game.tar.gz  # native Linux game
 "./My Game/launch-quarantine.sh"
 ```
 
-The first command unpacks the game and picks the exe, which is saved in `My Game/game.conf`. Both create `launch-quarantine.sh` in the game's folder; it starts the game in the sandbox with the monitor. If a game picked the wrong start file, change it with **Add > Set executable…** or edit `EXE=` in `game.conf`. Logs go in `My Game/logs/`.
+Both create a `launch-quarantine.sh` in the game's folder that starts the game in the sandbox with the monitor attached. If it picked the wrong start file, use **Add > Set executable…** or edit `EXE=` in `game.conf`. Logs go in the game's `logs/` folder.
 
-Only the `game/` folder (and `prefix/` for Windows games, `home/` for native ones) is writable from inside the sandbox. The rest of the game folder, including `game.conf` and the logs, is hidden from the game.
+From inside the sandbox, the game sees only its own `game/` folder, plus `prefix/` (Windows) or `home/` (native). `game.conf` and the logs stay hidden from it.
 
-## Known issues
+After you change the launcher template, `./update-launchers.sh` (a dry run by default, `--apply` to write) brings your existing games up to date. If you edit `verify-sandbox.sh` by hand, refresh its hash with `./verify-sandbox.sh --update-hash`.
+
+More detail on the app, every `game.conf` key and the limits box is in `wq-ui/README.md`.
+
+## Known gaps
+
+I'd rather list these than have you find them.
 
 - The shared `_umu-data` folder is writable by every Windows game, so one bad game could tamper with the runtime the others use.
 - Your whole Steam folder is mounted read-only inside the Windows-game sandbox.
-- Registry persistence detection may miss values added to an existing key.
-- Native games don't run `verify-sandbox.sh` (it was written for the Windows setup) and have no registry check.
+- Registry persistence detection can miss a value added to a key that already existed.
+- Native games don't get the Windows-specific sandbox verification or a registry check.
 - Sound, input and GPU devices stay visible unless you block them.
-- Games that keep running in the background after their start script exits can make a run look clean when it isn't.
+
+## Tests
+
+bash
+
+```bash
+python3 wq-ui/test_core.py
+bash wq-ui/test_profile.sh
+```
+
+These cover the parsing and the way settings become firejail arguments. They don't need firejail and don't test a real sandbox.
 
 Issues and pull requests are welcome.
+
+Thanks for taking interest - help me improve my harder than expected project that has consumed me for a bit over a year.
+
+-  Patrick.
