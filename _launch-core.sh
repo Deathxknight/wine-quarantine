@@ -41,7 +41,12 @@ ALERTLOG="$LOGDIR/alerts-$(date +%Y%m%d-%H%M%S).log"
 # everything printed from here on (sandbox verify failures, umu tracebacks...)
 # is also saved, so the wq-ui Debug report can include it
 LAUNCHLOG="$LOGDIR/launch-$(date +%Y%m%d-%H%M%S).log"
-exec > >(tee -a "$LAUNCHLOG") 2>&1
+# the log file stays plain; wq-colorize only colours what reaches a terminal
+if [ -x "$QROOT/wq-colorize" ]; then
+  exec > >(tee -a "$LAUNCHLOG" | "$QROOT/wq-colorize") 2>&1
+else
+  exec > >(tee -a "$LAUNCHLOG") 2>&1
+fi
 
 PROTONPATH="$(find_proton "$GAMEDIR" || true)"
 [ -n "$PROTONPATH" ] || { echo "FATAL: no Proton build found. See config.sh." >&2; exit 1; }
@@ -107,6 +112,8 @@ if [ "$PREFIX_FRESH" -eq 1 ]; then
     tail -n 20 "$LOGDIR/bootstrap.log" >&2 || true
     exit 1
   fi
+  # everything in the prefix right now is Wine's own runtime: wq-scan.sh skips it unless the game touches it later
+  touch "$GAMEDIR/.clam-baseline"
   echo "Bootstrap complete. Starting monitored run."
 fi
 
@@ -161,4 +168,6 @@ fi
 sleep 2
 
 "$QROOT/reg-diff.sh" compare "$GAMEDIR" "$ALERTLOG"
+# ClamAV: whatever the run changed in prefix/ and game/ (findings land in $ALERTLOG as ALERT lines)
+"$QROOT/wq-scan.sh" "$GAMENAME" --when run --alertlog "$ALERTLOG" || true
 "$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG"

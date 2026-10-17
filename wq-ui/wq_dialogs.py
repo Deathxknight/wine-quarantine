@@ -228,7 +228,9 @@ class NewGameDialog(QDialog):
     def _finished(self, name: str, code: int, status):
         self._read()
         self.proc = None
-        if getattr(self, "_cancelled", False):
+        ok = status == QProcess.ExitStatus.NormalExit and code == 0
+        # exit 0 after a cancel means it was the ClamAV scan that was cancelled: the game exists
+        if getattr(self, "_cancelled", False) and not ok:
             self.log.appendPlainText("\nCancelled. new-quarantine.sh removes the partly created folder itself.")
             self._set_busy(False)
             return

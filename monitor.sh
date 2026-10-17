@@ -21,9 +21,34 @@ ALERTLOG="${3:?usage: monitor.sh <GAMEDIR> <FIREJAIL_PID> <ALERTLOG>}"
 PREFIX="$GAMEDIR/prefix"
 GAMEBIN="$GAMEDIR/game"
 
-RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'; NC='\033[0m'
+# native Linux games get their own rules (lib-monitor-native.sh); everything else is the
+# original Windows/Wine monitor below, unchanged
+MODE=wine
+[ "$(read_game_conf "$GAMEDIR" RUNNER 2>/dev/null || true)" = "native" ] && MODE=native
+if [ "$MODE" = native ]; then
+  # shellcheck source=lib-monitor-native.sh
+  source "$SCRIPT_DIR/lib-monitor-native.sh" || { echo "monitor.sh: cannot load lib-monitor-native.sh" >&2; exit 1; }
+  # where the game thinks $HOME is (the launcher exports it; private home is the default)
+  NHOME="${WQ_MONITOR_HOME:-$GAMEDIR/home}"
+  NHOME="${NHOME%/}"
+fi
 
-KILL_FIRED=0
+RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'; NC='\033[0m'
+# colour only on a terminal (or WQ_FORCE_COLOR=1); monitor.out and pipes stay plain text
+USE_COLOR=0
+if [ -z "${NO_COLOR:-}" ] && { [ -t 1 ] || [ -n "${WQ_FORCE_COLOR:-}" ]; }; then USE_COLOR=1; fi
+
+# mkdir is atomic, so only one of the watcher subshells fires the kill switch
+KILL_FLAG="$GAMEDIR/logs/.monitor-killed"
+rm -rf "$KILL_FLAG"
+
+# MONITOR_KILL=0 (game.conf or the default profile): alerts are logged but do not stop the sandbox
+KILL_ON_ALERT=1
+if declare -F _wq_get >/dev/null 2>&1; then
+  [ "$(_wq_get "$GAMEDIR" MONITOR_KILL 1)" = 0 ] && KILL_ON_ALERT=0
+else
+  [ "$(read_game_conf "$GAMEDIR" MONITOR_KILL 2>/dev/null || true)" = 0 ] && KILL_ON_ALERT=0
+fi
 
 # events are queued in a file and flushed every LOG_FLUSH_INTERVAL seconds
 mkdir -p "$GAMEDIR/logs"
@@ -52,14 +77,17 @@ log() {
   msg="${msg//[[:cntrl:]]/}"   # file/process names can carry escape sequences
   buffer_event "$level" "$msg"
 
-  case "$level" in
-    ALERT) printf '%b[ALERT] %s%b\n' "$RED" "$msg" "$NC" ;;
-    WARN)  printf '%b[WARN]  %s%b\n' "$YEL" "$msg" "$NC" ;;
-    INFO)  printf '%b[INFO]  %s%b\n' "$GRN" "$msg" "$NC" ;;
-  esac
+  if [ "$USE_COLOR" = 1 ]; then
+    case "$level" in
+      ALERT) printf '%b[ALERT] %s%b\n' "$RED" "$msg" "$NC" ;;
+      WARN)  printf '%b[WARN]  %s%b\n' "$YEL" "$msg" "$NC" ;;
+      INFO)  printf '%b[INFO]  %s%b\n' "$GRN" "$msg" "$NC" ;;
+    esac
+  else
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$msg"
+  fi
 
-  if [ "$level" = "ALERT" ] && [ "$KILL_FIRED" -eq 0 ]; then
-    KILL_FIRED=1
+  if [ "$level" = "ALERT" ] && [ "$KILL_ON_ALERT" = 1 ] && mkdir "$KILL_FLAG" 2>/dev/null; then
     flush_log
 
     echo "[ALERT] Kill switch triggered - terminating sandbox." >> "$ALERTLOG"
@@ -69,7 +97,7 @@ log() {
     local term
     if term="$(detect_terminal 2>/dev/null)"; then
       term_run "$term" "Malware Alert: $(basename "$GAMEDIR")" malware-alert \
-        bash -c 'cat "$1"; echo; echo "--- press enter to close ---"; read -r' _ "$ALERTLOG" \
+        bash -c 'if [ -x "$2" ]; then WQ_FORCE_COLOR=1 "$2" < "$1"; else cat "$1"; fi; echo; echo "--- press enter to close ---"; read -r' _ "$ALERTLOG" "$SCRIPT_DIR/wq-colorize" \
         >/dev/null 2>&1 &
     else
       echo "[ALERT] No terminal emulator found; see $ALERTLOG" >> "$ALERTLOG"
@@ -110,17 +138,99 @@ SUSPICIOUS_PROCS="^(${SUSPICIOUS_PROCS})(\.exe)?$"
 PERSIST_KEYS='Run|RunOnce|RunServices|RunServicesOnce|Image File Execution Options|AppInit_DLLs|Winlogon|ShellServiceObjectDelayLoad|SharedTaskScheduler|Userinit|AppCertDlls|SilentProcessExit|KnownDLLs|BootExecute|Browser Helper Objects'
 
 PREFIX_FRESH=0
-[ ! -f "$PREFIX/system.reg" ] && PREFIX_FRESH=1
-if [ "$PREFIX_FRESH" -eq 1 ]; then
-  log INFO "Wine INIT (fresh prefix - system32/registry writes will be INFO, not ALERT)"
+if [ "$MODE" = wine ]; then
+  [ ! -f "$PREFIX/system.reg" ] && PREFIX_FRESH=1
+  if [ "$PREFIX_FRESH" -eq 1 ]; then
+    log INFO "Wine INIT (fresh prefix - system32/registry writes will be INFO, not ALERT)"
+  fi
 fi
 
-log INFO "Monitor started for $GAMEDIR (firejail pid $FIREJAIL_PID)"
-sleep 2
+log INFO "Monitor started for $GAMEDIR (firejail pid $FIREJAIL_PID, mode: $MODE)"
+[ "$KILL_ON_ALERT" = 1 ] || log WARN "Kill switch is OFF for this game (MONITOR_KILL=0): alerts are logged, the sandbox keeps running"
+# Wine needs a moment to set up. A native game does not, so watching starts at once for those.
+if [ "$MODE" = wine ]; then sleep 2; fi
 
 # filesystem watcher
+NATIVE_PIDS=()
+NATIVE_WARN_CAP=25
+NATIVE_SUPPRESSED="$GAMEDIR/logs/.native-suppressed"
+: > "$NATIVE_SUPPRESSED"
+rm -f "$NATIVE_SUPPRESSED.n"
+declare -A RC_BASE=()
+
+# one event from either native inotify pipeline: classify, then log
+native_fs_event() {
+  local event="$1" file="$2" res level kind msg
+  res="$(native_classify_path "$file" "$event" "$NHOME" "$GAMEBIN")" || return 0
+  [ -n "$res" ] || return 0
+  IFS=$'\t' read -r level kind msg <<< "$res"
+  if [ "$kind" = rc ]; then
+    # only a real content change counts (a skeleton .bashrc copied in at jail start is fine)
+    local rel="${file#"$NHOME"/}" now
+    now="$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)"
+    [ "$now" = "${RC_BASE[$rel]:-}" ] && return 0
+    native_is_skeleton "$file" "$rel" && return 0   # firejail's own skeleton file
+  fi
+  if [ "$level" = WARN ]; then
+    # a first-run unpack can write thousands of files: log the first few, count the rest
+    local n=0
+    [ -f "$NATIVE_SUPPRESSED.n" ] && n=$(wc -l < "$NATIVE_SUPPRESSED.n")
+    echo x >> "$NATIVE_SUPPRESSED.n"
+    if [ "$n" -ge "$NATIVE_WARN_CAP" ]; then echo x >> "$NATIVE_SUPPRESSED"; return 0; fi
+  fi
+  log "$level" "$msg"
+}
+
+if [ "$MODE" = native ]; then
+  for f in .bashrc .bash_profile .bash_login .bash_logout .profile .zshrc .zshenv .zprofile .zlogin \
+           .xprofile .xinitrc .xsession .xsessionrc .pam_environment .config/fish/config.fish; do
+    [ -f "$NHOME/$f" ] && RC_BASE[$f]="$(sha256sum "$NHOME/$f" 2>/dev/null | cut -d' ' -f1)"
+  done
+
+  R_PATHS=(); NR_PATHS=()
+  [ -d "$GAMEBIN" ] && R_PATHS+=("$GAMEBIN")
+  case "${WQ_MONITOR_PRIVATE:-1}" in
+    1)
+      # private home: the whole thing is the game's own, watch all of it
+      mkdir -p "$NHOME"
+      R_PATHS+=("$NHOME")
+      log INFO "Native mode: watching private home $NHOME and the game folder" ;;
+    *)
+      # the real $HOME is exposed (Hide home directory is off): best effort. Watching it
+      # recursively is not practical, so watch the persistence spots that exist, plus their
+      # parents (non-recursive) to catch the spots being created
+      log WARN "Home directory is NOT hidden for this game: monitoring $NHOME is best-effort"
+      for d in .config/autostart .config/systemd/user .config/environment.d .local/bin \
+               .local/share/applications .local/share/systemd/user .ssh; do
+        [ -d "$NHOME/$d" ] && R_PATHS+=("$NHOME/$d")
+      done
+      for d in "" .config .config/systemd .local .local/share .local/share/systemd; do
+        [ -d "$NHOME/$d" ] && NR_PATHS+=("$NHOME${d:+/$d}")
+      done ;;
+  esac
+
+  NATIVE_EXCLUDE='/(\.cache|mesa_shader_cache[^/]*|shader_cache|GPUCache|Code Cache)(/|$)'
+  NATIVE_EVENTS=(-e create -e moved_to -e close_write)
+  if [ "${#R_PATHS[@]}" -gt 0 ]; then
+    (
+      inotifywait -m -r "${NATIVE_EVENTS[@]}" --exclude "$NATIVE_EXCLUDE" --format '%e|%w%f' "${R_PATHS[@]}" 2>/dev/null |
+      while IFS='|' read -r event file; do native_fs_event "$event" "$file"; done
+    ) &
+    NATIVE_PIDS+=($!)
+  fi
+  if [ "${#NR_PATHS[@]}" -gt 0 ]; then
+    (
+      inotifywait -m "${NATIVE_EVENTS[@]}" --format '%e|%w%f' "${NR_PATHS[@]}" 2>/dev/null |
+      while IFS='|' read -r event file; do native_fs_event "$event" "$file"; done
+    ) &
+    NATIVE_PIDS+=($!)
+  fi
+  [ "${#NATIVE_PIDS[@]}" -eq 0 ] && log WARN "nothing to watch - filesystem monitoring disabled"
+fi
+
 WATCH_PATHS=()
 
+if [ "$MODE" = wine ]; then
 [ -d "$PREFIX/drive_c/windows/system32" ] && \
   WATCH_PATHS+=("$PREFIX/drive_c/windows/system32")
 
@@ -138,13 +248,14 @@ for u in "$PREFIX"/drive_c/users/*/; do
 done
 
 [ -d "$GAMEBIN" ] && WATCH_PATHS+=("$GAMEBIN")
+fi
 
-if [ "${#WATCH_PATHS[@]}" -eq 0 ]; then
+if [ "$MODE" = wine ] && [ "${#WATCH_PATHS[@]}" -eq 0 ]; then
   log WARN "no watch paths exist under $PREFIX - filesystem monitoring disabled"
 fi
 
 INOTIFY_PID=""
-if [ "${#WATCH_PATHS[@]}" -gt 0 ]; then
+if [ "$MODE" = wine ] && [ "${#WATCH_PATHS[@]}" -gt 0 ]; then
   (
     inotifywait -m \
       -e create -e moved_to -e moved_from -e delete \
@@ -262,6 +373,18 @@ while kill -0 "$FIREJAIL_PID" 2>/dev/null; do
 
     log INFO "New process: pid=$pid cmd=$cmd"
 
+    if [ "$MODE" = native ]; then
+      link="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+      nexe="${link% (deleted)}"; nexe="${nexe##*/}"
+      [ -n "$nexe" ] || nexe="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+      res="$(native_classify_proc "$nexe" "${exe##*/}" "$cmd" "$link")"
+      if [ -n "$res" ]; then
+        IFS=$'\t' read -r nlevel _ nmsg <<< "$res"
+        log "$nlevel" "$nmsg: pid=$pid cmd=$cmd"
+      fi
+      continue
+    fi
+
     if echo "$exe_base" | grep -qiE "$SUSPICIOUS_PROCS"; then
       log ALERT "Suspicious process running: pid=$pid cmd=$cmd"
       continue
@@ -302,6 +425,10 @@ while kill -0 "$FIREJAIL_PID" 2>/dev/null; do
 done
 
 # shutdown
+for np in "${NATIVE_PIDS[@]+"${NATIVE_PIDS[@]}"}"; do
+  pkill -P "$np" 2>/dev/null
+  kill "$np" 2>/dev/null
+done
 [ -n "$INOTIFY_PID" ] && {
   pkill -P "$INOTIFY_PID" 2>/dev/null   # children first, or they get orphaned
   kill "$INOTIFY_PID" 2>/dev/null
@@ -325,6 +452,12 @@ fi
 if [ "$RUNTIME_COUNT" -gt 0 ]; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $RUNTIME_COUNT known-runtime component(s) written to system32 (suppressed)" >> "$ALERTLOG"
 fi
+
+if [ -s "$NATIVE_SUPPRESSED" ]; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $(wc -l < "$NATIVE_SUPPRESSED") more executable/script write(s) not listed (first $NATIVE_WARN_CAP were)" >> "$ALERTLOG"
+fi
+rm -f "$NATIVE_SUPPRESSED" "$NATIVE_SUPPRESSED.n"
+rmdir "$KILL_FLAG" 2>/dev/null || true
 
 log INFO "Game process ended. Full log: $ALERTLOG"
 

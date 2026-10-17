@@ -113,6 +113,14 @@ chmod +x "$GAMEDIR/launch-quarantine.sh"
 
 trap - EXIT
 
+# ClamAV scan of what was just added. wq-scan.sh skips itself (and says why) when ClamAV or its
+# database is missing. Cancelling during the scan keeps the game, it only stops the scan.
+if [ "${WQ_SKIP_SCAN:-0}" != 1 ]; then
+  trap 'echo; echo "ClamAV scan cancelled. The game was added but not scanned (run: ./wq-scan.sh \"$GAMENAME\")"; exit 0' TERM INT HUP
+  "$QROOT/wq-scan.sh" "$GAMENAME" --when add || true
+  trap - TERM INT HUP
+fi
+
 echo
 echo "=== Done ==="
 echo "Game dir:  $GAMEDIR"

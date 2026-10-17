@@ -28,6 +28,15 @@ RUNTIME_COUNT=$(echo -n "$RUNTIME_INFO" | grep -c "^" 2>/dev/null || echo 0)
 # find newest regdiff log for this run, if any
 LATEST_REGDIFF=$(ls -t "$GAMEDIR/logs"/regdiff-*.log 2>/dev/null | head -n1)
 
+# home diff and ClamAV name their log in the alert log, so only this run's files are listed
+logref() {   # logref <prefix>  -> path of the newest <prefix>-YYYYMMDD-HHMMSS.log named in $ALERTLOG
+  local n; n=$(grep -o "$1-[0-9]\{8\}-[0-9]\{6\}\.log" "$ALERTLOG" 2>/dev/null | tail -n1)
+  [ -n "$n" ] && [ -f "$GAMEDIR/logs/$n" ] && printf '%s' "$GAMEDIR/logs/$n"
+}
+LATEST_HOMEDIFF=$(logref homediff)
+LATEST_CLAM=$(logref clamscan)
+CLAM_NOTE=$(grep -E 'ClamAV' "$ALERTLOG" 2>/dev/null | grep -vE '\[ALERT\]' | sed 's/^\[[^]]*\] \[[A-Z]*\] //; s/ \[output: [^]]*\]$//' | tail -n1)
+
 echo
 echo -e "${BOLD}========================================${NC}"
 echo -e "${BOLD} Quarantine Run Summary: $(basename "$GAMEDIR")${NC}"
@@ -74,6 +83,19 @@ fi
 if [ -n "$LATEST_REGDIFF" ]; then
   echo -e "${BOLD}--- Registry diff ---${NC}"
   echo "  Full diff: $LATEST_REGDIFF"
+  echo
+fi
+
+if [ -n "$LATEST_HOMEDIFF" ]; then
+  echo -e "${BOLD}--- Home diff ---${NC}"
+  echo "  Full diff: $LATEST_HOMEDIFF"
+  echo
+fi
+
+if [ -n "$CLAM_NOTE" ] || [ -n "$LATEST_CLAM" ]; then
+  echo -e "${BOLD}--- ClamAV ---${NC}"
+  [ -n "$CLAM_NOTE" ] && echo "  $CLAM_NOTE"
+  [ -n "$LATEST_CLAM" ] && echo "  Scanner output: $LATEST_CLAM"
   echo
 fi
 

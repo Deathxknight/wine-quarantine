@@ -36,6 +36,20 @@ fi
 PROTON_PREFERRED="${PROTON_PREFERRED:-}"
 
 REQUIRED_BINS=(firejail inotifywait python3)
+
+# --- ClamAV scanning (wq-scan.sh) -------------------------------------------
+# Scans game/ + prefix/ (or home/ for native games) when a game is added and
+# after every run. Override any of these in config.local.sh.
+: "${CLAM_SCAN_ON_ADD:=1}"        # scan game/ right after Add
+: "${CLAM_SCAN_AFTER_RUN:=1}"     # scan what the run changed (per game: CLAM_SCAN=0|1 in game.conf)
+: "${CLAM_FULL_EVERY_DAYS:=7}"    # after-run scans only look at changed files; do a full one this often
+: "${CLAM_STALE_DAYS:=7}"         # warn when the signature database is older than this
+: "${CLAM_MAX_FILESIZE:=200M}"    # files above this are skipped by clamscan
+: "${CLAM_SANDBOX:=1}"            # run clamscan inside a no-network firejail
+: "${CLAM_USE_DAEMON:=0}"         # 1 = use clamdscan (needs a running clamd) instead of clamscan
+: "${CLAM_DB_DIR:=}"              # empty = autodetect (/var/lib/clamav ...)
+: "${CLAM_BIN:=}"                 # empty = clamscan (or clamdscan) from PATH; set a full path to override
+: "${CLAM_EXCLUDE_REGEX:=}"       # extended regex, matching paths are not scanned
 ALERT_TERMINAL="${ALERT_TERMINAL:-}"
 
 POLL_INTERVAL="${POLL_INTERVAL:-5}"

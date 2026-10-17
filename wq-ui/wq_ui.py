@@ -19,10 +19,11 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import (QFile, QFileSystemWatcher, QObject, QPointF, QProcess, QRectF, QSize, Qt, QTimer,
+from PySide6.QtCore import (QEvent, QFile, QFileSystemWatcher, QObject, QPointF, QProcess, QRectF, QSize, Qt, QTimer,
                             QUrl, Signal)
 from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QGuiApplication, QIcon, QImage,
-                           QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF)
+                           QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF,
+                           QFont, QSyntaxHighlighter, QTextCharFormat)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
@@ -430,6 +431,113 @@ class SettingsDialog(QDialog):
 # ---------------------------------------------------------------------------
 # main window
 # ---------------------------------------------------------------------------
+# ---- wq-log-highlighter begin
+# ---------------------------------------------------------------------------
+# log colouring for the Launcher output and Monitor alerts panes.
+# Display only: pane text, log files and copy/paste are untouched.
+# ---------------------------------------------------------------------------
+import re as _re
+
+_LOG_TS = _re.compile(r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\]")
+_LOG_PREFIX = _re.compile(r"^\[[^\]\s][^\]]*\](?= )")
+_LOG_HEAD = _re.compile(r"^(?:\[[^\]]+\] )?(?:--- .+ ---|-- .+)$")
+_LOG_BAR = _re.compile(r"^(?:\[[^\]]+\] )?={5,}\s*$")
+_LOG_ERR = _re.compile(r"^(?:\[[^\]]+\] )?(FATAL|ERROR|Error)\b")
+_LOG_VERDICT = _re.compile(r"VERDICT: (REVIEW NEEDED|CLEAN|OK|PASS)")
+_LOG_TAGS = (("[ALERT]", "alert_tag"), ("[WARN]", "warn_tag"), ("[LEAK]", "alert_tag"),
+             ("[INFO]", "info"), ("[info]", "info"), ("[ok]", "ok"))
+
+
+def log_spans(line: str, prefix: bool = False) -> list[tuple[int, int, str]]:
+    """(start, length, style) in the order they are applied; later spans win."""
+    n = len(line)
+    out: list[tuple[int, int, str]] = []
+    if "[ALERT]" in line or "[LEAK]" in line:
+        out.append((0, n, "alert_line"))
+    elif "[WARN]" in line:
+        out.append((0, n, "warn_line"))
+    if _LOG_HEAD.match(line):
+        out.append((0, n, "heading"))
+    elif _LOG_BAR.match(line):
+        out.append((0, n, "dim"))
+    m = _LOG_ERR.match(line)
+    if m:
+        out.append((m.start(1), m.end(1) - m.start(1), "bad"))
+    if prefix:
+        m = _LOG_PREFIX.match(line)
+        if m:
+            out.append((0, m.end(), "dim"))
+    for m in _LOG_TS.finditer(line):
+        out.append((m.start(), m.end() - m.start(), "dim"))
+    for tag, style in _LOG_TAGS:
+        i = line.find(tag)
+        while i != -1:
+            out.append((i, len(tag), style))
+            i = line.find(tag, i + len(tag))
+    m = _LOG_VERDICT.search(line)
+    if m:
+        out.append((m.start(1), m.end(1) - m.start(1), "bad" if m.group(1) == "REVIEW NEEDED" else "verdict_ok"))
+    return out
+
+
+class LogHighlighter(QSyntaxHighlighter):
+    _fmt: dict = {}
+    _prefix = False
+
+    def __init__(self, document, theme, prefix: bool = False):
+        super().__init__(document)
+        self._theme, self._prefix = theme, prefix
+        self.refresh()
+
+    def refresh(self):
+        c = self._theme.color
+
+        def f(fg=None, bg=None, bold=False):
+            t = QTextCharFormat()
+            if fg:
+                t.setForeground(c(fg))
+            if bg:
+                t.setBackground(c(bg))
+            if bold:
+                t.setFontWeight(QFont.Weight.Bold)
+            return t
+
+        self._fmt = {
+            "alert_line": f("error"), "warn_line": f("warn"),
+            "alert_tag": f("surface", "error", True), "warn_tag": f("surface", "warn", True),
+            "heading": f("primary", bold=True), "dim": f("on_surface_variant"),
+            "info": f("primary"), "ok": f("ok"), "bad": f("error", bold=True),
+            "verdict_ok": f("ok", bold=True),
+        }
+        self.rehighlight()
+
+    def highlightBlock(self, text):
+        for start, length, style in log_spans(text, self._prefix):
+            fmt = self._fmt.get(style)
+            if fmt is not None:
+                self.setFormat(start, length, fmt)
+# ---- wq-log-highlighter end
+
+
+class _ClickOpensCombo(QObject):
+    """Editable combo boxes only open their list from the arrow. A plain click on the text opens it
+    too; Ctrl+click (or Tab into the field) puts the caret in to type a custom value."""
+
+    def __init__(self, combo):
+        super().__init__(combo)
+        self.combo = combo
+        combo.lineEdit().installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if (ev.type() == QEvent.Type.MouseButtonPress
+                and ev.button() == Qt.MouseButton.LeftButton
+                and not (ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
+                and self.combo.isEnabled()):
+            self.combo.showPopup()
+            return True
+        return False
+
+
 class MainWindow(QMainWindow):
     COLS = ["Game", "Executable", "Location", "Network", "Display", "State"]
 
@@ -649,6 +757,7 @@ class MainWindow(QMainWindow):
             return gl
 
         group("Isolation", [o for o in core.BOOL_OPTS if o.group == "isolation"])
+        group("Monitoring", [o for o in core.BOOL_OPTS if o.group == "monitoring"])
         gl_dev = group("Devices", [o for o in core.BOOL_OPTS if o.group == "devices"])
 
         # hide single /dev nodes (--blacklist)
@@ -701,6 +810,7 @@ class MainWindow(QMainWindow):
             for t, val in presets:
                 c.addItem(t, val)
             c.lineEdit().setPlaceholderText(core.TEXT_HINTS[key])
+            _ClickOpensCombo(c)
             c.setToolTip(tip)
             c.editTextChanged.connect(lambda *_, k=key: self._text_edited(k))
             self.texts[key] = c
@@ -741,6 +851,7 @@ class MainWindow(QMainWindow):
             self.iface.addItem(name)
             self.iface.setItemData(self.iface.count() - 1, kind, Qt.ItemDataRole.ToolTipRole)
         self.iface.lineEdit().setPlaceholderText("e.g. enp5s0 or br0")
+        _ClickOpensCombo(self.iface)
         self.iface.editTextChanged.connect(lambda *_: self._text_edited("FJ_NET_IFACE"))
         self.texts["FJ_NET_IFACE"] = self.iface
         row.addWidget(self.iface, 1)
@@ -781,6 +892,7 @@ class MainWindow(QMainWindow):
             if self.xsize.findData(extra) < 0:
                 self.xsize.addItem(extra, extra)
         self.xsize.lineEdit().setPlaceholderText("WIDTHxHEIGHT")
+        _ClickOpensCombo(self.xsize)
         self.xsize.editTextChanged.connect(lambda *_: self._text_edited("FJ_XEPHYR_SIZE"))
         self.texts["FJ_XEPHYR_SIZE"] = self.xsize
         row.addWidget(self.xsize, 1)
@@ -959,6 +1071,7 @@ class MainWindow(QMainWindow):
         self.console.setObjectName("console")
         self.console.setReadOnly(True)
         self.console.setMaximumBlockCount(5000)
+        self.hl_console = LogHighlighter(self.console.document(), self.theme, prefix=True)
         tv.addWidget(self.console)
         sp.addWidget(top)
 
@@ -970,6 +1083,7 @@ class MainWindow(QMainWindow):
         self.alerts = QPlainTextEdit()
         self.alerts.setObjectName("alerts")
         self.alerts.setReadOnly(True)
+        self.hl_alerts = LogHighlighter(self.alerts.document(), self.theme)
         bv.addWidget(self.alerts)
         sp.addWidget(bot)
         return w
@@ -1055,6 +1169,9 @@ class MainWindow(QMainWindow):
 
     def on_theme_changed(self):
         self.refresh_icons()
+        for hl in (getattr(self, "hl_console", None), getattr(self, "hl_alerts", None)):
+            if hl is not None:
+                hl.refresh()
         self.refresh_colors()
         self.refresh_paths()
         self.refresh_attempt_rows()

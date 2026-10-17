@@ -193,6 +193,15 @@ def collect(qroot: Path, game: str | None) -> dict:
     sz = shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
     add(OK if sz else WARN, "7z (optional)", sz or "not found")
 
+    # ClamAV scanning (wq-scan.sh --check reports the binary and database state)
+    try:
+        chk = subprocess.run([str(qroot / "wq-scan.sh"), "--check"], capture_output=True, text=True, timeout=20).stdout.strip()
+    except Exception as e:                                  # noqa: BLE001
+        chk = f"wq-scan.sh --check failed: {e}"
+    clam_ok = bool(chk) and "not found" not in chk.splitlines()[0] and "database: none" not in chk and "failed" not in chk
+    add(OK if clam_ok else WARN, "ClamAV scan (optional)", chk.replace("\n", "; ") or "no output",
+        "" if clam_ok else "Install clamav and run: sudo freshclam")
+
     term = R.get("TERMINAL", "")
     add(OK if term else WARN, "terminal for alert window", term or "none detected",
         "" if term else "Set ALERT_TERMINAL in config.local.sh.")

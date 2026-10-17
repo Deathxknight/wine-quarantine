@@ -39,6 +39,14 @@ BOOL_OPTS: list[BoolOpt] = [
     BoolOpt("FJ_NOU2F", "Block U2F / security keys", False, "--nou2f", "devices"),
     BoolOpt("FJ_NOTV", "Block TV / DVB devices", False, "--notv", "devices"),
     BoolOpt("FJ_NODVD", "Block optical drives", False, "--nodvd", "devices"),
+    BoolOpt("CLAM_SCAN", "ClamAV scan after each run", True,
+            "Scan what the run changed with clamscan. Off = no scan after runs (CLAM_SCAN=0). "
+            "Wine games: the files from the first-run bootstrap are skipped, only what the game adds is scanned.",
+            "monitoring"),
+    BoolOpt("MONITOR_KILL", "Alerts stop the sandbox", True,
+            "On: the first ALERT kills the sandbox (kill switch). Off: alerts are still logged and "
+            "show in the summary, but the game keeps running (MONITOR_KILL=0).",
+            "monitoring"),
 ]
 BOOL_BY_KEY = {o.key: o for o in BOOL_OPTS}
 

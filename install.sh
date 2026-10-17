@@ -61,6 +61,8 @@ need unzip unzip
 if command -v 7z >/dev/null || command -v 7zz >/dev/null || command -v 7za >/dev/null; then ok 7z; else warn "7z missing (optional)"; missing+=("${EXTRA_7Z:-p7zip}"); fi
 command -v unrar >/dev/null && ok unrar || warn "unrar missing (optional)"
 command -v Xephyr >/dev/null && ok "Xephyr (optional)" || warn "Xephyr missing (optional, only for isolated X11)"
+if command -v clamscan >/dev/null; then ok "clamscan (optional, scans games on add and after runs)"
+else warn "clamscan missing (optional: scans games on add and after runs)"; missing+=("clamav"); fi
 if python3 -c 'import PySide6.QtWidgets' 2>/dev/null; then ok "PySide6"; else bad "PySide6 missing (needed for the UI)"; missing+=("${QT:-PySide6}"); fi
 
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -71,6 +73,14 @@ if [ "${#missing[@]}" -gt 0 ]; then
     ask "  Run it now?" && $PM "${missing[@]}"
   else
     echo "  Unknown package manager. Install: ${missing[*]}"
+  fi
+fi
+
+# ClamAV needs a signature database before it can scan anything
+if command -v clamscan >/dev/null; then
+  if "$QROOT/wq-scan.sh" --check 2>/dev/null | grep -q '^database: none'; then
+    warn "ClamAV has no signature database yet"
+    ask "  Run 'sudo freshclam' now (needs internet)?" && sudo freshclam
   fi
 fi
 

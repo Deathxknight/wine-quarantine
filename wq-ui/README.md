@@ -20,7 +20,7 @@ Needs PySide6. `integrate.py` keeps backups as `<file>.wq-orig` and supports `--
 | `new-native.sh`, `_launch-native.sh` | Create and launch native Linux games |
 | `wq_debug.py` | Dependency checks and a redacted bug-report builder |
 | `integrate.py` | One-time wiring into the main scripts |
-| `test_core.py`, `test_profile.sh` | Tests |
+| `test_core.py`, `test_profile.sh`, `test_native_monitor_scan.sh` | Tests |
 
 ## Toolbar
 
@@ -38,7 +38,9 @@ Needs PySide6. `integrate.py` keeps backups as `<file>.wq-orig` and supports `--
 
 * Only `game/` is writable.
 * With "Hide home directory" on, `$HOME` is `<game>/home`, so saves persist between runs.
-* `verify-sandbox.sh` is not run and there is no registry check.
+* `verify-sandbox.sh` is not run. In place of the registry check, `home-diff.sh` compares startup files, autostart entries, systemd user units, `~/.local/bin`, `~/.ssh` and the executables under `game/` before and after the run.
+* `monitor.sh` runs in native mode (`lib-monitor-native.sh`), see the main README.
+* `wq-scan.sh` (ClamAV) scans `game/` and `home/` after each run.
 * The launcher exits with the game's own exit code.
 
 ## Tabs
@@ -53,6 +55,10 @@ Boxes show the effective value: this game's setting, else the default profile, e
 ## Keys in game.conf and profile.defaults.conf
 
 The header of `profile.sh` lists them all. The ones added with native support: `RUNNER` (`native`), `FJ_DEV_BLOCK` (repeatable), `FJ_HOOK_PRE` and `FJ_HOOK_POST` (per game only, never read from the defaults file).
+
+## ClamAV keys in game.conf
+
+`CLAM_SCAN=0|1` overrides the global `CLAM_SCAN_AFTER_RUN` for this game. The global settings live in `config.sh` / `config.local.sh`, see the main README. The Monitor tab shows the findings because they are written to the run's alert log. There is no checkbox for them in the app yet.
 
 ## Limits and extra options
 

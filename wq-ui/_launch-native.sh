@@ -7,7 +7,10 @@
 #  * only <game>/game/ is writable (plus anything whitelisted in wq-ui)
 #  * with "Hide home directory" on, $HOME is <game>/home so saves persist
 #  * verify-sandbox.sh isn't run, it was written for the Wine setup
-#  * no registry snapshot
+#  * no registry snapshot: home-diff.sh does the same job for startup files, autostart
+#    entries, systemd user units, ~/.local/bin, ~/.ssh and new executables in game/
+#  * monitor.sh runs in native mode (lib-monitor-native.sh) because game.conf has RUNNER=native
+#  * wq-scan.sh (ClamAV) scans game/ and home/ after the run
 set -euo pipefail
 
 QROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
@@ -56,14 +59,27 @@ apply_game_profile "$GAMEDIR"
 # private home that persists, instead of firejail's throwaway one
 NATIVE_HOME="${WQ_NATIVE_HOME:-$GAMEDIR/home}"
 FJ_ARGS=()
+WQ_MONITOR_PRIVATE=0
 for a in "${QUARANTINE_FIREJAIL_ARGS[@]}"; do
   if [ "$a" = "--private" ]; then
     mkdir -p "$NATIVE_HOME"
     FJ_ARGS+=("--private=$NATIVE_HOME")
+    WQ_MONITOR_PRIVATE=1
   else
     FJ_ARGS+=("$a")
   fi
 done
+# what the game sees as $HOME, for monitor.sh and home-diff.sh
+if [ "$WQ_MONITOR_PRIVATE" = 1 ]; then WQ_MONITOR_HOME="$NATIVE_HOME"; else WQ_MONITOR_HOME="$HOME"; fi
+export WQ_MONITOR_HOME WQ_MONITOR_PRIVATE
+
+# after the run: home diff + ClamAV scan + summary
+post_run() {   # post_run <game exit code>
+  "$QROOT/home-diff.sh" compare "$GAMEDIR" "$ALERTLOG" || true
+  "$QROOT/wq-scan.sh" "$GAMENAME" --when run --alertlog "$ALERTLOG" || true
+  sleep 1   # let the tee'd launch log flush
+  "$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" "$1" || true
+}
 
 WL_ARGS=("--whitelist=$GAMEDIR/game" "--read-write=$GAMEDIR/game")
 mapfile -t -O "${#WL_ARGS[@]}" WL_ARGS < <(profile_extra_whitelist_args)
@@ -71,6 +87,8 @@ mapfile -t BL_ARGS < <(build_blacklist_args)
 
 export WQ_EXE_NAME="$EXE_NAME"
 cd "$EXEDIR"
+
+"$QROOT/home-diff.sh" snapshot "$GAMEDIR"
 
 ${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
   firejail "${FJ_ARGS[@]}" "${WL_ARGS[@]}" "${BL_ARGS[@]}" -- \
@@ -114,15 +132,10 @@ ${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u
       esac
     ' &
 GAME_PID=$!
-sleep 1
-if ! kill -0 "$GAME_PID" 2>/dev/null; then          # already gone, quick script or failed start
-  GAME_RC=0
-  wait "$GAME_PID" || GAME_RC=$?
-  echo "wq: game exited within a second (code $GAME_RC)"
-  sleep 1; "$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" "$GAME_RC" || true
-  exit "$GAME_RC"
-fi
 
+# Start the monitor at once. A native game is running within milliseconds, and whatever it does in
+# the first seconds would go unwatched if the monitor waited. If the game is already gone (a quick
+# script, a failed start) the monitor simply ends.
 "$QROOT/monitor.sh" "$GAMEDIR" "$GAME_PID" "$ALERTLOG" >>"$LOGDIR/monitor.out" 2>&1 &
 MONITOR_PID=$!
 
@@ -132,6 +145,5 @@ echo "wq: game exited with code $GAME_RC"
 for _ in 1 2 3 4 5; do kill -0 "$MONITOR_PID" 2>/dev/null || break; sleep 1; done
 wait "$MONITOR_PID" 2>/dev/null || true
 
-sleep 1   # let the tee'd launch log flush
-"$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" "$GAME_RC" || true
+post_run "$GAME_RC"
 exit "$GAME_RC"
