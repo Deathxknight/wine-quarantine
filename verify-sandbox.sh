@@ -4,6 +4,11 @@
 #
 # Runs inside the firejail sandbox before the game is exec'd.
 # Exit codes: 0 all checks passed, 90 a check failed, 91 self-hash mismatch.
+#
+# QVERIFY_MODE=native (set by wq-ui/_launch-native.sh) runs the checks that apply to any game:
+# capabilities, no_new_privs, seccomp, network, resolver sockets, mount propagation, D-Bus and
+# ssh-agent, and that the game folder cannot see its own config and logs. The Wine-specific ones
+# (prefix, umu data, $HOME contents: a native game's $HOME is its own persistent folder) are skipped.
 
 set -u
 
@@ -33,9 +38,16 @@ if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
   exit 91
 fi
 
+MODE="${QVERIFY_MODE:-windows}"
 GAMEDIR="${QVERIFY_GAMEDIR:?QVERIFY_GAMEDIR not set}"
-UMU_DATA="${QVERIFY_UMU_DATA:?QVERIFY_UMU_DATA not set}"
-HOST_USER="${QVERIFY_HOST_USER:?QVERIFY_HOST_USER not set}"
+if [ "$MODE" = native ]; then
+  SUBDIRS=(game)
+  UMU_DATA=""
+else
+  SUBDIRS=(game prefix)
+  UMU_DATA="${QVERIFY_UMU_DATA:?QVERIFY_UMU_DATA not set}"
+  HOST_USER="${QVERIFY_HOST_USER:?QVERIFY_HOST_USER not set}"
+fi
 
 PASS=0
 FAIL=0
@@ -102,28 +114,32 @@ else
   || fail "DNS resolver socket visible (bypasses --net=none):$RES_BAD"
 fi
 
-# $HOME should be a fresh tmpfs with at most firejail's shell startup files
-ALLOWED_HOME_ENTRIES=(.inputrc .zshrc .bashrc .Xauthority)  # firejail --private copies this in for X11
-while IFS= read -r wl; do
-  case "$wl" in
-    "$HOME"/*) rest="${wl#"$HOME"/}"; ALLOWED_HOME_ENTRIES+=("${rest%%/*}") ;;
-  esac
-done <<< "${QVERIFY_WL_PATHS:-}"
-HOME_BAD=0
-while IFS= read -r entry; do
-  [ -z "$entry" ] && continue
-  allowed=0
-  for a in "${ALLOWED_HOME_ENTRIES[@]}"; do
-    [ "$entry" = "$a" ] && { allowed=1; break; }
-  done
-  if [ "$allowed" -eq 0 ]; then
-if skipped home; then HOME_BAD=0; else
-fail "\$HOME/$entry present - real home leaked"
-HOME_BAD=1
-fi
+if [ "$MODE" = native ]; then
+  pass "native mode: \$HOME is the game's own private home, contents not checked"
+else
+  # $HOME should be a fresh tmpfs with at most firejail's shell startup files
+  ALLOWED_HOME_ENTRIES=(.inputrc .zshrc .bashrc .Xauthority)  # firejail --private copies this in for X11
+  while IFS= read -r wl; do
+    case "$wl" in
+      "$HOME"/*) rest="${wl#"$HOME"/}"; ALLOWED_HOME_ENTRIES+=("${rest%%/*}") ;;
+    esac
+  done <<< "${QVERIFY_WL_PATHS:-}"
+  HOME_BAD=0
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    allowed=0
+    for a in "${ALLOWED_HOME_ENTRIES[@]}"; do
+      [ "$entry" = "$a" ] && { allowed=1; break; }
+    done
+    if [ "$allowed" -eq 0 ]; then
+  if skipped home; then HOME_BAD=0; else
+  fail "\$HOME/$entry present - real home leaked"
+  HOME_BAD=1
   fi
-done < <(ls -A "$HOME" 2>/dev/null)
-[ "$HOME_BAD" -eq 0 ] && pass "\$HOME contains only expected shell files ($HOME)"
+    fi
+  done < <(ls -A "$HOME" 2>/dev/null)
+  [ "$HOME_BAD" -eq 0 ] && pass "\$HOME contains only expected shell files ($HOME)"
+fi
 
 # /proc/1/root
 if [ -r /proc/1/root ]; then
@@ -136,20 +152,35 @@ if [ -r /proc/1/root ]; then
   fi
 fi
 
-# mount propagation
-prop_ok=1
-if [ -r /proc/self/mountinfo ]; then
-  while read -r _ _ _ _ _ _ _ _ _ _ _ _ _ opts _; do
-    case "$opts" in
-      *shared:*|*slave:*)
-        prop_ok=0
-        break
-        ;;
-    esac
-  done < /proc/self/mountinfo
+# mount propagation: a "shared" mount would carry mounts and unmounts made inside the jail out to
+# the host. /proc/self/mountinfo is
+#   ID parent maj:min root mountpoint options [optional fields...] - fstype source superopts
+# and the optional fields (shared:N, master:N, propagate_from:N, unbindable) sit between field 6 and
+# the " - " separator, so the number of fields before it varies. "master:" is a slave mount, which
+# only receives events and is what firejail sets up; only "shared:" leaks.
+shared_mounts() {
+  local line pre
+  local -a f
+  while IFS= read -r line; do
+    case "$line" in *" - "*) ;; *) continue ;; esac
+    pre="${line%% - *}"
+    read -ra f <<< "$pre"
+    [ "${#f[@]}" -ge 7 ] || continue
+    local opt
+    for opt in "${f[@]:6}"; do
+      case "$opt" in shared:*) printf '%s\n' "${f[4]}"; break ;; esac
+    done
+  done
+}
+if skipped propagation; then
+  pass "mount propagation check skipped"
+elif [ ! -r /proc/self/mountinfo ]; then
+  pass "mountinfo not readable, propagation not checked"
+else
+  SHARED="$(shared_mounts < /proc/self/mountinfo | head -n 5 | tr '\n' ' ')"
+  [ -z "$SHARED" ] && pass "no shared mounts visible" \
+                   || fail "shared mount propagation: ${SHARED% } (if this firejail does not make mounts slave here, set WQ_VERIFY_SKIP_EXTRA=propagation in config.local.sh)"
 fi
-[ "$prop_ok" -eq 1 ] && pass "no shared/slave mounts visible" \
-                     || fail "shared mount propagation detected"
 
 # environment
 dbus_val="${DBUS_SESSION_BUS_ADDRESS:-}"
@@ -169,16 +200,20 @@ esac
                             || fail "SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
 
 # whitelisted paths
-for sub in game prefix; do
+for sub in "${SUBDIRS[@]}"; do
   [ -d "$GAMEDIR/$sub" ] && pass "$sub/ visible ($GAMEDIR/$sub)" \
                          || fail "$sub/ not visible ($GAMEDIR/$sub)"
 done
-[ -d "$UMU_DATA" ] && pass "UMU_DATA visible ($UMU_DATA)" \
-                   || fail "UMU_DATA not visible ($UMU_DATA)"
+if [ "$MODE" != native ]; then
+  [ -d "$UMU_DATA" ] && pass "UMU_DATA visible ($UMU_DATA)" \
+                     || fail "UMU_DATA not visible ($UMU_DATA)"
+fi
 
 # the game must not be able to see its own config, logs or snapshots
 LEAK=0
-for h in game.conf logs .reg-snapshot launch-quarantine.sh; do
+HIDDEN=(game.conf logs .reg-snapshot .home-snapshot launch-quarantine.sh)
+[ "$MODE" = native ] && HIDDEN+=(home)     # the private home is mounted as $HOME, not at this path
+for h in "${HIDDEN[@]}"; do
   if [ -e "$GAMEDIR/$h" ]; then
     fail "$GAMEDIR/$h is visible inside the sandbox"
     LEAK=1
@@ -187,7 +222,7 @@ done
 [ "$LEAK" -eq 0 ] && pass "game.conf, logs and snapshots are not visible"
 
 # game/ and prefix/ must be writable
-for sub in game prefix; do
+for sub in "${SUBDIRS[@]}"; do
   if touch "$GAMEDIR/$sub/.verify-write-probe" 2>/dev/null; then
     rm -f "$GAMEDIR/$sub/.verify-write-probe"
     pass "$sub/ is writable"

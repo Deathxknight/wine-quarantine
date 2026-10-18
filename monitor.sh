@@ -38,6 +38,10 @@ RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'; NC='\033[0m'
 USE_COLOR=0
 if [ -z "${NO_COLOR:-}" ] && { [ -t 1 ] || [ -n "${WQ_FORCE_COLOR:-}" ]; }; then USE_COLOR=1; fi
 
+# Stop signals the whole process group. Survive it (handlers reset in the watcher subshells, which
+# is what we want) so the loop below sees the sandbox gone and writes the final events.
+trap ':' TERM INT HUP
+
 # mkdir is atomic, so only one of the watcher subshells fires the kill switch
 KILL_FLAG="$GAMEDIR/logs/.monitor-killed"
 rm -rf "$KILL_FLAG"
@@ -90,7 +94,7 @@ log() {
   if [ "$level" = "ALERT" ] && [ "$KILL_ON_ALERT" = 1 ] && mkdir "$KILL_FLAG" 2>/dev/null; then
     flush_log
 
-    echo "[ALERT] Kill switch triggered - terminating sandbox." >> "$ALERTLOG"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ALERT] Kill switch triggered - terminating sandbox." >> "$ALERTLOG"
 
     kill -TERM -"$FIREJAIL_PID" 2>/dev/null || kill -TERM "$FIREJAIL_PID" 2>/dev/null
 
@@ -100,7 +104,7 @@ log() {
         bash -c 'if [ -x "$2" ]; then WQ_FORCE_COLOR=1 "$2" < "$1"; else cat "$1"; fi; echo; echo "--- press enter to close ---"; read -r' _ "$ALERTLOG" "$SCRIPT_DIR/wq-colorize" \
         >/dev/null 2>&1 &
     else
-      echo "[ALERT] No terminal emulator found; see $ALERTLOG" >> "$ALERTLOG"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ALERT] No terminal emulator found; see $ALERTLOG" >> "$ALERTLOG"
     fi
   fi
 }
@@ -323,14 +327,18 @@ declare -A PPID_OF
 declare -A SEEN_PIDS
 declare -A PENDING_PIDS
 
+# One read per pid and no fork: this runs every poll over every process on the machine, and an
+# awk per pid was hundreds of forks each time. /proc/N/stat is "pid (comm) S ppid ...", comm may
+# contain spaces and ')', so strip up to the LAST ") ".
 refresh_tree() {
   PPID_OF=()
-  local d pid ppid
+  local d pid line rest
   for d in /proc/[0-9]*; do
     pid="${d#/proc/}"
-    [ -r "$d/stat" ] || continue
-    ppid=$(awk '{ sub(/^[^)]*\) /,""); print $2 }' "$d/stat" 2>/dev/null)
-    [ -n "$ppid" ] && PPID_OF[$pid]=$ppid
+    read -r line < "$d/stat" 2>/dev/null || continue
+    rest="${line##*) }"          # "S ppid pgrp ..."
+    rest="${rest#* }"            # "ppid pgrp ..."
+    [ -n "${rest%% *}" ] && PPID_OF[$pid]="${rest%% *}"
   done
 }
 
@@ -434,6 +442,9 @@ done
   kill "$INOTIFY_PID" 2>/dev/null
 }
 
+# logged before the final flush: afterwards nothing would write it to the alert log any more
+log INFO "Game process ended. Full log: $ALERTLOG"
+
 sleep 1
 if [ -s "$LOG_BUFFER_LOCK" ]; then
   ts=$(date '+%Y-%m-%d %H:%M:%S')
@@ -458,8 +469,6 @@ if [ -s "$NATIVE_SUPPRESSED" ]; then
 fi
 rm -f "$NATIVE_SUPPRESSED" "$NATIVE_SUPPRESSED.n"
 rmdir "$KILL_FLAG" 2>/dev/null || true
-
-log INFO "Game process ended. Full log: $ALERTLOG"
 
 kill "$FLUSHER_PID" 2>/dev/null
 wait "$FLUSHER_PID" 2>/dev/null || true

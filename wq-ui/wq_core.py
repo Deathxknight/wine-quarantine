@@ -401,6 +401,21 @@ def substitute_tokens(sheet: str, tokens: dict[str, str]) -> str:
     return _TOKEN.sub(lambda m: tokens.get(m.group(1).replace("-", "_"), m.group(0)), sheet)
 
 
+_ALERT_META = re.compile(r"Kill switch triggered|No terminal emulator found|ClamAV flagged \d+ of|ClamAV: \.\.\. and \d+ more")
+
+
+def count_alerts(text: str) -> tuple[int, int]:
+    """(alerts, warnings) in a monitor alert log. One finding is one alert: lines that only
+    describe another alert (kill switch fired, ClamAV's totals) are not counted. Same rule as
+    summarize-run.sh."""
+    lines = text.splitlines()
+    alerts = [ln for ln in lines if "[ALERT]" in ln]
+    n = sum(1 for ln in alerts if not _ALERT_META.search(ln))
+    if alerts:
+        n = max(n, 1)
+    return n, sum(1 for ln in lines if "[WARN]" in ln)
+
+
 BUILTIN_QSS = """
 * { font-size: 13px; }
 QWidget { color: @on_surface; }
@@ -422,6 +437,7 @@ QTreeWidget, QTableWidget, QListWidget, QPlainTextEdit, QLineEdit, QComboBox, QS
     selection-background-color: @primary; selection-color: @on_primary; }
 QTreeWidget#gameList { border-radius: 8px; }
 QTreeWidget::item, QTableWidget::item, QListWidget::item { padding: 4px 2px; }
+QTreeWidget, QTableWidget, QListWidget { outline: 0; }   /* no dotted focus box around the current cell */
 QHeaderView::section { background: @surface_container_high; color: @on_surface_variant; border: 0; padding: 5px 8px; }
 QLineEdit, QComboBox { padding: 5px 8px; }
 QComboBox QAbstractItemView { background: @surface_container; selection-background-color: @primary; selection-color: @on_primary; }
@@ -464,6 +480,10 @@ QLabel[status="ok"] { color: @ok; }
 QLabel[status="warn"] { color: @warn; }
 QLabel[status="bad"] { color: @error; }
 QLabel[status="muted"], QLabel#hint { color: @on_surface_variant; }
+QLabel#badge { border-radius: 9px; padding: 1px 10px; border: 1px solid @outline; }
+QLabel#badge[status="ok"] { color: @ok; border-color: @ok; }
+QLabel#badge[status="warn"] { color: @warn; border-color: @warn; }
+QLabel#badge[status="bad"] { color: @error; border-color: @error; }
 QLabel#banner { background: @surface_container_high; border: 1px solid @outline; border-radius: 6px; padding: 8px 10px; }
 QLabel#banner[status="warn"] { border-color: @warn; }
 QLabel#banner[status="bad"] { border-color: @error; }

@@ -5,6 +5,8 @@
 set -euo pipefail
 
 QROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$QROOT/config.sh"
 
 [ $# -ge 1 ] || { echo "Usage: new-native.sh <GameName> [folder|archive|file]" >&2; exit 1; }
 GAMENAME="$1"
@@ -72,11 +74,7 @@ case "$EXE" in ""|/*|..|../*|*/..|*/../*|*$'\n'*|*$'\r'*) echo "Error: unsafe pa
 
 printf '# start script / binary, relative to game/\nEXE=%s\nRUNNER=native\n' "$EXE" > "$GAMEDIR/game.conf"
 
-cat > "$GAMEDIR/launch-quarantine.sh" <<'EOS'
-#!/bin/bash
-D="$(dirname "$(readlink -f "$0")")"
-exec "$(dirname "$D")/wq-ui/_launch-native.sh" "$(basename "$D")"
-EOS
+wq_launcher_text native > "$GAMEDIR/launch-quarantine.sh"
 chmod +x "$GAMEDIR/launch-quarantine.sh"
 
 trap - EXIT

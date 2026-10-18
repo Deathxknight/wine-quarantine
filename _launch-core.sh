@@ -42,11 +42,19 @@ ALERTLOG="$LOGDIR/alerts-$(date +%Y%m%d-%H%M%S).log"
 # is also saved, so the wq-ui Debug report can include it
 LAUNCHLOG="$LOGDIR/launch-$(date +%Y%m%d-%H%M%S).log"
 # the log file stays plain; wq-colorize only colours what reaches a terminal
+# (the logger ignores TERM/INT/HUP: when Stop signals the whole group it must outlive the game,
+# or the post-run summary below would write into a dead pipe)
 if [ -x "$QROOT/wq-colorize" ]; then
-  exec > >(tee -a "$LAUNCHLOG" | "$QROOT/wq-colorize") 2>&1
+  exec > >(trap '' TERM INT HUP; tee -a "$LAUNCHLOG" | "$QROOT/wq-colorize") 2>&1
 else
-  exec > >(tee -a "$LAUNCHLOG") 2>&1
+  exec > >(trap '' TERM INT HUP; tee -a "$LAUNCHLOG") 2>&1
 fi
+
+# Stop in the app signals this whole process group. The sandbox and the monitor die from it; this
+# script carries on to the registry diff, the ClamAV scan and the verdict, which are the part you
+# want after stopping a game you don't trust. (A handler, not "ignore": children reset handlers.)
+STOP_REQUESTED=0
+trap 'STOP_REQUESTED=1' TERM INT HUP
 
 PROTONPATH="$(find_proton "$GAMEDIR" || true)"
 [ -n "$PROTONPATH" ] || { echo "FATAL: no Proton build found. See config.sh." >&2; exit 1; }
@@ -117,6 +125,8 @@ if [ "$PREFIX_FRESH" -eq 1 ]; then
   echo "Bootstrap complete. Starting monitored run."
 fi
 
+[ "$STOP_REQUESTED" -eq 0 ] || { echo "Stopped before the game started."; exit 130; }
+
 cd "$EXEDIR"
 
 "$QROOT/reg-diff.sh" snapshot "$GAMEDIR"
@@ -132,7 +142,10 @@ GAME_PID=$!
 sleep 1
 
 if ! kill -0 "$GAME_PID" 2>/dev/null; then
-  echo "FATAL: firejail failed to start (or sandbox verification aborted)" >&2
+  EARLY_RC=0; wait "$GAME_PID" 2>/dev/null || EARLY_RC=$?
+  echo "FATAL: firejail failed to start (or sandbox verification aborted), exit code $EARLY_RC" >&2
+  # a failed preflight gets the proper verdict instead of just an error line
+  case "$EARLY_RC" in 90|91|97) "$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" "$EARLY_RC" || true ;; esac
   exit 1
 fi
 
@@ -151,7 +164,13 @@ else
   MONITOR_PID=$!
 fi
 
-wait "$GAME_PID" || true
+# wait returns early when Stop's signal is trapped, so keep waiting until the sandbox is really gone.
+# GAME_RC is firejail's exit code: 90/91 = sandbox verification failed, 97 = native preflight failed.
+GAME_RC=0
+while :; do
+  GAME_RC=0; wait "$GAME_PID" || GAME_RC=$?      # (|| keeps set -e from ending the script)
+  kill -0 "$GAME_PID" 2>/dev/null || break
+done
 
 if [ -n "${MONITOR_PID:-}" ]; then
   for _ in 1 2 3 4 5; do
@@ -170,4 +189,4 @@ sleep 2
 "$QROOT/reg-diff.sh" compare "$GAMEDIR" "$ALERTLOG"
 # ClamAV: whatever the run changed in prefix/ and game/ (findings land in $ALERTLOG as ALERT lines)
 "$QROOT/wq-scan.sh" "$GAMENAME" --when run --alertlog "$ALERTLOG" || true
-"$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG"
+"$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" "$GAME_RC" || true

@@ -11,7 +11,7 @@ wine-quarantine runs each game in its own [firejail](https://firejail.wordpress.
 It makes running something sketchy _less risky_. It does not make it safe, it is VERY important to understand that first . 
 
 - It's a firejail sandbox, not a VM. The game shares your kernel and runs as your user.
-- The monitor is a tripwire. It matches names and polls every few seconds, so a careful piece of malware can slip past it.
+- The monitor is a tripwire. It matches names and polls every two seconds (`POLL_INTERVAL`), and only looks at a process once it has been seen on two polls, so a careful piece of malware can slip past it.
 - X11 is only isolated if you turn on the private X server (Xephyr) for that game. 
 - Multiplayer games need the network, and that weakens the sandbox. The allow-list helps, but it isn't a guarantee.
 - The cybersecurity space is ever evolving - this is the best i can do alone.
@@ -20,7 +20,7 @@ If you think a file is real malware, use a VM, or don't run it.
 
 ## How it works
 
-**It checks itself before every run.** Before the game starts, `verify-sandbox.sh` runs _inside_ the jail and looks at the facts: capabilities dropped, no-new-privileges set, seccomp filter active, only a loopback interface, no DNS resolver socket reachable, your real `$HOME` not visible, no D-Bus or SSH agent leaking in. If any check fails, the game doesn't start. The script also hashes itself, so a tampered copy refuses to run.
+**It checks itself before every run.** Before the game starts, `verify-sandbox.sh` runs _inside_ the jail and looks at the facts: capabilities dropped, no-new-privileges set, seccomp filter active, only a loopback interface, no DNS resolver socket reachable, your real `$HOME` not visible, no D-Bus or SSH agent leaking in, and no mount that propagates out of the jail. If any check fails, the game doesn't start. The script also hashes itself, so a tampered copy refuses to run.
 
 **It watches while the game runs.** The monitor follows the game's process tree and the files it touches. It raises an alert for things like a script or executable dropped in a Startup folder, writes to `system32`, a registry hive changing at runtime, or a game spawning `powershell`, `certutil`, `curl` or `rundll32`. **The first alert stops the sandbox** and opens a terminal with the log. For Windows games it also snapshots the registry before the run and diffs it afterwards, looking for persistence keys such as `Run`, services and `AppInit_DLLs`.
 
@@ -133,7 +133,7 @@ Both create a `launch-quarantine.sh` in the game's folder that starts the game i
 
 From inside the sandbox, the game sees only its own `game/` folder, plus `prefix/` (Windows) or `home/` (native). `game.conf` and the logs stay hidden from it.
 
-After you change the launcher template, `./update-launchers.sh` (a dry run by default, `--apply` to write) brings your existing games up to date. If you edit `verify-sandbox.sh` by hand, refresh its hash with `./verify-sandbox.sh --update-hash`.
+Each game's `launch-quarantine.sh` is a three-line wrapper, so a launcher fix reaches every game without touching them. `./update-launchers.sh` (a dry run by default, `--apply` to write) is only for games made by an older version, which got a big self-contained launcher, or for a launcher that went missing. It keeps the old one as `launch-quarantine.sh.bak` and recovers the chosen executable into `game.conf`. If you edit `verify-sandbox.sh` by hand, refresh its hash with `./verify-sandbox.sh --update-hash`.
 
 More detail on the app, every `game.conf` key and the limits box is in `wq-ui/README.md`.
 
@@ -143,8 +143,9 @@ I'd rather list these than have you find them.
 
 - The shared `_umu-data` folder is writable by every Windows game, so one bad game could tamper with the runtime the others use.
 - Your whole Steam folder is mounted read-only inside the Windows-game sandbox.
-- Registry persistence detection can miss a value added to a key that already existed.
-- Native games don't get the Windows-specific sandbox verification. Their monitor, `home-diff.sh` and ClamAV checks are described above, and are tripwires of the same kind.
+- Registry persistence detection looks at autostart and hijack locations (`Run`, `RunOnce`, `Image File Execution Options`, `Winlogon`, `AppInit_DLLs`, services whose `ImagePath` is outside `system32`, and a few more). It compares what each key holds before and after, so a value added to an existing key counts. A persistence trick outside that list is not seen.
+- Native games run the same verifier in a `native` mode: capabilities, no-new-privileges, seccomp, network, resolver sockets, mount propagation, D-Bus and the SSH agent, and that the game can't see its own config, logs or snapshots. The Wine-specific checks (prefix, umu data, what is in `$HOME`, since a native game's home is its own persistent folder) are skipped. After that the launcher's own preflight runs, as before. Set `NATIVE_VERIFY=0` in `config.local.sh` to turn the native verifier off. Their monitor, `home-diff.sh` and ClamAV checks are described above, and are tripwires of the same kind.
+- The mount-propagation check fails on a `shared:` mount (one whose mounts and unmounts would reach the host) and accepts `master:` (slave) mounts, which is what firejail sets up. If a setup trips it wrongly, `WQ_VERIFY_SKIP_EXTRA=propagation` in `config.local.sh` skips just that check on every game.
 - If "Hide home directory" is off for a native game, its monitoring of your real `$HOME` is best-effort: only the usual persistence spots are watched.
 - The ClamAV scan runs after the fact. It tells you what a run left behind, it does not stop the run.
 - Sound, input and GPU devices stay visible unless you block them.
@@ -157,9 +158,12 @@ bash
 python3 wq-ui/test_core.py
 bash wq-ui/test_profile.sh
 bash wq-ui/test_native_monitor_scan.sh
+bash wq-ui/test_launchers.sh
+bash wq-ui/test_regdiff.sh
+bash wq-ui/test_verify.sh
 ```
 
-The last one covers the native monitor rules, `home-diff.sh`, `wq-scan.sh` and a full native launch, with stand-ins for `clamscan`, `inotifywait` and `firejail`. These cover the parsing and the way settings become firejail arguments. They don't need firejail and don't test a real sandbox.
+`test_native_monitor_scan.sh` covers the native monitor rules, `home-diff.sh`, `wq-scan.sh` and a full native launch, `test_launchers.sh` the launcher flow (exit codes, Stop, verdicts, `update-launchers.sh`) `test_regdiff.sh` the registry diff on Wine-format files and `test_verify.sh` the verifier (mountinfo parsing, native mode, self-hash), all with stand-ins for `clamscan`, `inotifywait` and `firejail`. These cover the parsing and the way settings become firejail arguments. They don't need firejail and don't test a real sandbox.
 
 Issues and pull requests are welcome.
 
