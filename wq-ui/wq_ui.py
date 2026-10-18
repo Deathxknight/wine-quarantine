@@ -554,6 +554,7 @@ class MainWindow(QMainWindow):
         self.dirty: set[str] = set()                      # scalar keys touched in the panel
         self.staged: dict[str, dict[str, list[str]]] = {}  # list keys edited, per game
         self.procs: dict[str, dict] = {}
+        self.stopping: set[str] = set()                   # Stop pressed, launcher still finishing its checks
         self.attempts: dict[tuple, int] = {}              # (game, addr, port) -> table row
         self._loading = False
         self._busy = False
@@ -702,9 +703,12 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_protection_tab(), "Protection")
         self.tabs.addTab(self._build_paths_tab(), "Paths")
         self.tabs.addTab(self._build_network_tab(), "Network")
-        self.tabs.addTab(self._build_monitor_tab(), "Monitor")
+        self.monitor_tab = self._build_monitor_tab()
+        self.tabs.addTab(self.monitor_tab, "Monitor")
 
-        bar = QHBoxLayout()
+        self.apply_bar = QWidget()
+        bar = QHBoxLayout(self.apply_bar)
+        bar.setContentsMargins(0, 0, 0, 0)
         self.pending_label = label("", "muted", wrap=False)
         bar.addWidget(self.pending_label, 1)
         self.btn_reset = QPushButton("Reset to defaults")
@@ -719,7 +723,9 @@ class MainWindow(QMainWindow):
         self.btn_apply.clicked.connect(lambda: self.apply_changes())
         for b in (self.btn_reset, self.btn_save_defaults, self.btn_apply):
             bar.addWidget(b)
-        rv.addLayout(bar)
+        rv.addWidget(self.apply_bar)
+        # Apply / Reset / Save only mean something for the profile tabs, not for the log view
+        self.tabs.currentChanged.connect(lambda i: self.apply_bar.setVisible(self.tabs.widget(i) is not self.monitor_tab))
         split.addWidget(right)
         split.setStretchFactor(0, 5)
         split.setStretchFactor(1, 6)
@@ -1078,8 +1084,14 @@ class MainWindow(QMainWindow):
         bot = QWidget()
         bv = QVBoxLayout(bot)
         bv.setContentsMargins(0, 0, 0, 0)
+        title_row = QHBoxLayout()
         self.alert_title = QLabel("Monitor alerts")
-        bv.addWidget(self.alert_title)
+        title_row.addWidget(self.alert_title, 1)
+        self.alert_badge = QLabel("")
+        self.alert_badge.setObjectName("badge")
+        self.alert_badge.setVisible(False)
+        title_row.addWidget(self.alert_badge)
+        bv.addLayout(title_row)
         self.alerts = QPlainTextEdit()
         self.alerts.setObjectName("alerts")
         self.alerts.setReadOnly(True)
@@ -1151,7 +1163,9 @@ class MainWindow(QMainWindow):
             net = {"off": ("off", "ok"), "filtered": ("filtered", "warn"), "learn": ("learning", "warn"),
                    "open": ("OPEN", "bad")}[mode]
             xe = ("Xephyr", "ok") if g.flag("FJ_XEPHYR", self.defaults) else ("host X11", "muted")
-            if g.name in self.procs:
+            if g.name in self.stopping and g.name in self.procs:
+                st = ("■ stopping, checking…", "warn")
+            elif g.name in self.procs:
                 st = ("● running", "ok")
             elif not g.exe_ready:
                 st = ("needs EXE", "bad")
@@ -1799,7 +1813,7 @@ class MainWindow(QMainWindow):
                 return
         for g in games:
             self.launch(g)
-        self.tabs.setCurrentIndex(3)
+        self.tabs.setCurrentWidget(self.monitor_tab)
 
     def launch(self, g: core.Game):
         if g.name in self.procs:
@@ -1886,6 +1900,7 @@ class MainWindow(QMainWindow):
         self.on_output(name)
         self.console.appendPlainText(f"[{name}] exited with code {code}")
         self.procs.pop(name, None)
+        self.stopping.discard(name)
         self.refresh_rows()
         self.load_all()
 
@@ -1893,10 +1908,14 @@ class MainWindow(QMainWindow):
         for g in self.loaded_games():
             d = self.procs.get(g.name)
             if d:
+                # the sandbox and monitor stop at once; the launcher itself carries on to the
+                # registry/home diff, the ClamAV scan and the verdict
+                self.stopping.add(g.name)
                 try:
                     os.killpg(d["proc"].processId(), signal.SIGTERM)
                 except (ProcessLookupError, PermissionError, OSError):
                     d["proc"].terminate()
+        self.refresh_rows()
 
     def refresh_trace(self):
         """Tail <game>/logs/firejail-trace.log and feed connect() lines to the attempts table."""
@@ -1932,6 +1951,7 @@ class MainWindow(QMainWindow):
         if g is None:
             if force:
                 self.alerts.clear()
+                self.alert_badge.setVisible(False)
                 self.alert_title.setText("Monitor alerts — select a single game")
                 self._alert_sig = None
             return
@@ -1939,6 +1959,7 @@ class MainWindow(QMainWindow):
         if not logs:
             if force or self._alert_sig != (g.name, None):
                 self.alerts.setPlainText("")
+                self.alert_badge.setVisible(False)
                 self.alert_title.setText(f"Monitor alerts — {g.name}: no alert logs yet")
                 self._alert_sig = (g.name, None)
             return
@@ -1959,7 +1980,22 @@ class MainWindow(QMainWindow):
             return
         self.alerts.setPlainText(text)
         self.alerts.verticalScrollBar().setValue(self.alerts.verticalScrollBar().maximum())
+        self.update_badge(text)
         self.alert_title.setText(f"Monitor alerts — {g.name} / {latest.name}")
+
+    def update_badge(self, text: str):
+        n_alert, n_warn = core.count_alerts(text)
+        if n_alert:
+            txt, st = f"{n_alert} alert{'s' if n_alert != 1 else ''}", "bad"
+            if n_warn:
+                txt += f", {n_warn} warning{'s' if n_warn != 1 else ''}"
+        elif n_warn:
+            txt, st = f"{n_warn} warning{'s' if n_warn != 1 else ''}", "warn"
+        else:
+            txt, st = "clean", "ok"
+        self.alert_badge.setText(txt)
+        set_prop(self.alert_badge, "status", st)
+        self.alert_badge.setVisible(True)
 
     # ------------------------------------------------- add game / exe / folder
     def refresh_game_list(self):

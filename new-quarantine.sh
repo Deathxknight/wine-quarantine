@@ -15,7 +15,7 @@ SOURCE="${2:-}"
 GAMEDIR="$QROOT/$GAMENAME"
 
 case "$GAMENAME" in
-  ""|*/*|.|..) echo "Error: invalid game name '$GAMENAME'" >&2; exit 1 ;;
+  ""|*/*|.|..|_*|.*|-*|*$'\n'*) echo "Error: invalid game name '$GAMENAME' (no slashes, and not starting with _ . or -)" >&2; exit 1 ;;
 esac
 
 [ -e "$GAMEDIR" ] && { echo "Error: $GAMEDIR already exists." >&2; exit 1; }
@@ -51,14 +51,26 @@ if ! ls "$UMU_DATA/umu"/steamrt* >/dev/null 2>&1; then
   fi
 fi
 
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Error: '$1' is required for this archive." >&2; exit 1; }; }
+
 if [ -n "$SOURCE" ]; then
-  case "$SOURCE" in
-    *.zip) unzip -q "$SOURCE" -d "$GAMEDIR/game" ;;
-    *.rar) unrar x -inul "$SOURCE" "$GAMEDIR/game/" ;;
-    *.7z)  7z x -o"$GAMEDIR/game" "$SOURCE" >/dev/null ;;
-    *.exe) cp "$SOURCE" "$GAMEDIR/game/" ;;
-    *)     cp -r "$SOURCE" "$GAMEDIR/game/" ;;
-  esac
+  case "$SOURCE" in -*) SOURCE="./$SOURCE" ;; esac
+  if [ -d "$SOURCE" ]; then
+    cp -a "$SOURCE"/. "$GAMEDIR/game/"
+  else
+    case "${SOURCE,,}" in
+      *.zip)            need unzip; unzip -q "$SOURCE" -d "$GAMEDIR/game" ;;
+      *.rar)            need unrar; unrar x -inul "$SOURCE" "$GAMEDIR/game/" ;;
+      *.7z)             SEVENZ="$(command -v 7z || command -v 7zz || command -v 7za || true)"
+                        [ -n "$SEVENZ" ] || { echo "Error: 7z (7zz / 7za) is required for this archive." >&2; exit 1; }
+                        "$SEVENZ" x -y -o"$GAMEDIR/game" "$SOURCE" >/dev/null ;;
+      *.tar.gz|*.tgz)   need tar;   tar -xzf "$SOURCE" --no-same-owner -C "$GAMEDIR/game" ;;
+      *.tar.xz|*.txz)   need tar;   tar -xJf "$SOURCE" --no-same-owner -C "$GAMEDIR/game" ;;
+      *.tar.bz2|*.tbz2) need tar;   tar -xjf "$SOURCE" --no-same-owner -C "$GAMEDIR/game" ;;
+      *.tar)            need tar;   tar -xf  "$SOURCE" --no-same-owner -C "$GAMEDIR/game" ;;
+      *)                cp "$SOURCE" "$GAMEDIR/game/" ;;
+    esac
+  fi
 fi
 
 [ -d "$GAMEDIR/game" ] || { echo "Error: game dir missing after extraction" >&2; exit 1; }
@@ -68,7 +80,7 @@ echo "Scanning for .exe files..."
 mapfile -d '' -t EXES < <(find "$GAMEDIR/game" -iname "*.exe" \
   -not -iname "unins*" -not -iname "*redist*" -not -iname "*vcredist*" \
   -not -iname "*directx*" -not -iname "dxsetup*" -not -iname "*crashhandler*" \
-  -not -iname "*crashpad*" -print0 2>/dev/null)
+  -not -iname "*crashpad*" -print0 2>/dev/null | sort -z)
 
 EXEPATH=""
 if [ "${#EXES[@]}" -eq 0 ]; then
@@ -82,7 +94,9 @@ else
     echo "  (stdin not a TTY, taking first: ${EXES[0]})"
     EXEPATH="${EXES[0]}"
   else
+    PS3="Start file (number): "
     select choice in "${EXES[@]}" "__MANUAL__"; do
+      [ -n "$choice" ] || { echo "Pick a number from the list."; continue; }
       if [ "$choice" = "__MANUAL__" ]; then
         EXEPATH=""
       else
@@ -104,11 +118,7 @@ fi
 printf '# exe path, relative to game/\nEXE=%s\n' "$EXE" > "$GAMEDIR/game.conf"
 
 # convenience wrapper: no embedded data, resolves everything from its own location
-cat > "$GAMEDIR/launch-quarantine.sh" <<'EOF'
-#!/bin/bash
-D="$(dirname "$(readlink -f "$0")")"
-exec "$(dirname "$D")/_launch-core.sh" "$(basename "$D")"
-EOF
+wq_launcher_text windows > "$GAMEDIR/launch-quarantine.sh"
 chmod +x "$GAMEDIR/launch-quarantine.sh"
 
 trap - EXIT

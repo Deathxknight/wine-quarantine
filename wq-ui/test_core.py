@@ -194,4 +194,19 @@ assert "FJ_MACHINE_ID" in c.ALL_BOOLS and c.ALL_BOOLS["FJ_MACHINE_ID"] is True
 assert set(c.TEXT_KEYS) <= set(c.TEXT_HINTS) and c.EXTRA_ARGS_KEY in c.LIST_KEYS
 print("extra-option storage: ok")
 
+
+# ---- alert counting (the Monitor tab badge; mirrors summarize-run.sh)
+_log = """[2026-10-18 09:06:25] [INFO] Monitor started
+[2026-10-18 09:06:27] [WARN] New executable (ELF) written in game folder: probe-dropped-elf
+[2026-10-18 09:06:27] [WARN] New script/executable written in game folder: probe-dropped.sh
+[2026-10-18 09:06:40] [ALERT] ClamAV: home/eicar-test.com: Eicar-Signature
+[2026-10-18 09:06:40] [ALERT] ClamAV flagged 1 of 4 scanned file(s) in probeV6. Treat this game as hostile
+"""
+assert c.count_alerts(_log) == (1, 2), c.count_alerts(_log)
+assert c.count_alerts("") == (0, 0)
+assert c.count_alerts("[t] [ALERT] curl\n[t] [ALERT] Kill switch triggered - terminating sandbox.\n") == (1, 0)
+assert c.count_alerts("[t] [ALERT] Kill switch triggered - terminating sandbox.\n") == (1, 0)
+assert c.count_alerts("[t] [ALERT] a\n[t] [ALERT] b\n[t] [ALERT] ClamAV: ... and 3 more detection(s)\n") == (2, 0)
+print("alert counting ok")
+
 print("\nALL CORE TESTS PASSED")

@@ -19,7 +19,8 @@ s/\[INFO\]/\x1b[36m[INFO]\x1b[0m/
 s/\[info\]/\x1b[36m[info]\x1b[0m/
 s/\[ok\]/\x1b[32m[ok]\x1b[0m/
 s/\[LEAK\]/\x1b[1;31m[LEAK]\x1b[0m/
-s/(VERDICT: )(REVIEW NEEDED)/\1\x1b[1;31m\2\x1b[0m/
+s/(VERDICT: )(REVIEW NEEDED|LAUNCH BLOCKED|SANDBOX LEAK)/\1\x1b[1;31m\2\x1b[0m/
+s/(VERDICT: )(OK, minor notes)/\1\x1b[1;33m\2\x1b[0m/
 s/(VERDICT: )(CLEAN|OK|PASS)/\1\x1b[1;32m\2\x1b[0m/
 s/^(FATAL|ERROR|Error)(:)/\x1b[1;31m\1\2\x1b[0m/
 s/^(--- .* ---)$/\x1b[1;34m\1\x1b[0m/

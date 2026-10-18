@@ -1,181 +1,120 @@
 #!/bin/bash
-
+# update-launchers.sh - bring every game's launch-quarantine.sh up to date.
+#
+# A launcher is a three-line wrapper around _launch-core.sh (Windows games) or
+# wq-ui/_launch-native.sh (native games, RUNNER=native in game.conf). All the logic lives in
+# those scripts, so this only matters for games made by an older version, which got a
+# big self-contained launcher, and for a launcher that went missing.
+#
 # Usage:
-#   ./update-launchers.sh                  dry-run
+#   ./update-launchers.sh                  dry-run, all games
 #   ./update-launchers.sh --apply          write changes
 #   ./update-launchers.sh <GameName>       one game, dry-run
 #   ./update-launchers.sh --apply <Game>   one game, apply
+#
+# An old launcher is kept as launch-quarantine.sh.bak. A game that predates game.conf gets one,
+# with EXE= taken from its old launcher.
 
 set -euo pipefail
 
 QROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# shellcheck source=config.sh
 . "$QROOT/config.sh"
-
-TEMPLATE="$QROOT/launcher-template.sh.in"
-UMU_DATA="$QROOT/_umu-data"
 
 APPLY=0
 TARGET=""
 for arg in "$@"; do
   case "$arg" in
     --apply|-a) APPLY=1 ;;
-    -*) echo "Unknown flag: $arg" >&2; exit 1 ;;
-    *)  TARGET="$arg" ;;
+    -h|--help)  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)         echo "Unknown flag: $arg" >&2; exit 1 ;;
+    *)          TARGET="${arg%/}" ;;
   esac
 done
 
-[ -f "$TEMPLATE" ] || { echo "Error: template not found: $TEMPLATE" >&2; exit 1; }
-
+# value of KEY="..." in an old self-contained launcher
 extract_quoted() {
   local file="$1" key="$2"
-  grep -m1 -E "^${key}=\"" "$file" 2>/dev/null \
-    | sed -E "s/^${key}=\"(.*)\"$/\1/"
+  [ -f "$file" ] || return 1
+  grep -m1 -E "^${key}=\"" "$file" 2>/dev/null | sed -E "s/^${key}=\"(.*)\"\$/\\1/"
 }
 
-esc() { printf '%s' "$1" | sed 's/[&|\\]/\\&/g'; }
-
-derive_exe_info() {
-  local gamedir="$1"
-  local gamedir_full="$gamedir/game"
-
-  [ -d "$gamedir_full" ] || return 1
-
-  local exe
-  exe=$(find "$gamedir_full" \
-      -type d \( \
-        -iname '_Redist' -o \
-        -iname '_CommonRedist' -o \
-        -iname 'Redist' -o \
-        -iname 'DirectX' -o \
-        -iname 'dotNetFx*' -o \
-        -iname 'oalinst*' \
-      \) -prune -o \
-      -type f -iname '*.exe' \
-        -not -iname 'unins*' \
-        -not -iname '*vcredist*' \
-        -not -iname 'dxsetup*' \
-        -not -iname '*crashhandler*' \
-        -not -iname '*crashpad*' \
-        -not -iname '*selector*' \
-        -not -iname '*setup*' \
-        -not -iname '*launcher*' \
-        -not -iname '*config*' \
-        -not -iname 'oalinst*' \
-        -not -iname '*redist*' \
-        -print 2>/dev/null | sort | head -1)
-
-  [ -n "$exe" ] || return 1
-
-  printf '%s|./%s' "$(dirname "$exe")" "$(basename "$exe")"
+# EXE for game.conf, recovered from an old launcher (EXEDIR is absolute, EXE_REL_PATH is ./name)
+legacy_exe() {
+  local gamedir="$1" launcher="$1/launch-quarantine.sh" dir name rel
+  dir="$(extract_quoted "$launcher" EXEDIR || true)"
+  name="$(extract_quoted "$launcher" EXE_REL_PATH || true)"
+  [ -n "$dir" ] && [ -n "$name" ] || return 1
+  rel="${dir#"$gamedir/game"}"; rel="${rel#/}"
+  name="${name#./}"
+  [ "$dir" = "${dir#"$gamedir/game"}" ] && return 1     # not under game/
+  printf '%s' "${rel:+$rel/}$name"
 }
 
-first_protonpath() {
-  local cand
-  for cand in "$STEAM_ROOT"/compatibilitytools.d/*/toolmanifest.vdf; do
-    [ -e "$cand" ] || continue
-    dirname "$cand"
-    return 0
-  done
-  return 1
-}
+update_one() {
+  local gamedir="$1" name runner launcher want tmp
+  name="$(basename "$gamedir")"
+  launcher="$gamedir/launch-quarantine.sh"
 
-render() {
-  local out="$1" gamename="$2" gamedir="$3" exedir="$4" exename="$5" protonpath="$6"
+  runner=windows
+  [ "$(read_game_conf "$gamedir" RUNNER 2>/dev/null || true)" = native ] && runner=native
+  want="$(wq_launcher_text "$runner")"
 
-  sed \
-    -e "s|@@GAMENAME@@|$(esc "$gamename")|g" \
-    -e "s|@@GAMEDIR@@|$(esc "$gamedir")|g" \
-    -e "s|@@EXEDIR@@|$(esc "$exedir")|g" \
-    -e "s|@@EXENAME@@|$(esc "$exename")|g" \
-    -e "s|@@PROTONPATH@@|$(esc "$protonpath")|g" \
-    -e "s|@@UMU_DATA@@|$(esc "$UMU_DATA")|g" \
-    -e "s|@@QROOT@@|$(esc "$QROOT")|g" \
-    "$TEMPLATE" > "$out"
-
-  grep -qE '@@[A-Za-z0-9_]+@@' "$out" && return 1
-  return 0
-}
-
-regenerate_one() {
-  local gamedir="$1"
-  local gamename; gamename="$(basename "$gamedir")"
-  local launcher="$gamedir/launch-quarantine.sh"
-
-  # If the launcher already has a working EXE_REL_PATH, keep it. Otherwise
-  # derive one - a hand-edit could have picked a different exe than the
-  # find filter would.
-  local existing_exe existing_dir
-  existing_exe="$(extract_quoted "$launcher" EXE_REL_PATH 2>/dev/null || true)"
-  existing_dir="$(extract_quoted "$launcher" EXEDIR 2>/dev/null || true)"
-
-  local info exedir exename
-  if [ -n "$existing_exe" ] && [ "$existing_exe" != "CHANGE_ME.exe" ] \
-     && [ -n "$existing_dir" ] && [ -f "$existing_dir/$existing_exe" ]; then
-    exedir="$existing_dir"
-    exename="$existing_exe"
-  else
-    if ! info=$(derive_exe_info "$gamedir"); then
-      printf '  %-20s ERROR: no exe found under %s/game\n' "$gamename" "$gamedir"
-      return 1
+  # a game from before game.conf: keep its exe choice
+  local note=""
+  if ! read_game_conf "$gamedir" EXE >/dev/null 2>&1; then
+    local exe
+    if exe="$(legacy_exe "$gamedir")" && valid_exe_rel "$exe"; then
+      note="game.conf would get EXE=$exe"
+      if [ "$APPLY" -eq 1 ]; then
+        { [ -f "$gamedir/game.conf" ] && cat "$gamedir/game.conf"; printf 'EXE=%s\n' "$exe"; } > "$gamedir/game.conf.new"
+        mv "$gamedir/game.conf.new" "$gamedir/game.conf"
+        note="game.conf written with EXE=$exe"
+      fi
+    else
+      note="no EXE= in game.conf and none recoverable: set it in the app (Add > Set executable)"
     fi
-    exedir="${info%|*}"
-    exename="${info#*|}"
   fi
 
-  local protonpath
-  protonpath=$(extract_quoted "$launcher" PROTONPATH 2>/dev/null || true)
-  if [ -z "$protonpath" ]; then
-    protonpath=$(first_protonpath || true)
-  fi
-  [ -z "$protonpath" ] && protonpath="$STEAM_ROOT/compatibilitytools.d/GE-Proton11-6-x86_64"
-
-  local tmp; tmp=$(mktemp)
-  if ! render "$tmp" "$gamename" "$gamedir" "$exedir" "$exename" "$protonpath"; then
-    printf '  %-20s ERROR: unsubstituted placeholders\n' "$gamename"
-    grep -nE '@@[A-Za-z0-9_]+@@' "$tmp" | sed 's/^/      /'
-    rm -f "$tmp"; return 1
-  fi
-
-  if [ -f "$launcher" ] && cmp -s "$tmp" "$launcher"; then
-    rm -f "$tmp"
-    printf '  %-20s up to date (exe=%s)\n' "$gamename" "$exename"
+  if [ -f "$launcher" ] && [ "$(cat "$launcher")" = "$want" ]; then
+    printf '  %-24s up to date (%s)%s\n' "$name" "$runner" "${note:+  - $note}"
     return 0
   fi
 
-  printf '  %-20s CHANGES:\n' "$gamename"
-  [ -f "$launcher" ] && { diff -u "$launcher" "$tmp" | sed 's/^/      /' || true; }
-  printf '      exe would be: %s\n' "$exename"
+  if [ -f "$launcher" ]; then
+    printf '  %-24s REPLACE (%s), old launcher kept as launch-quarantine.sh.bak%s\n' "$name" "$runner" "${note:+  - $note}"
+  else
+    printf '  %-24s CREATE (%s)%s\n' "$name" "$runner" "${note:+  - $note}"
+  fi
 
   if [ "$APPLY" -eq 1 ]; then
-    cp "$tmp" "$launcher.new"
-    mv "$launcher.new" "$launcher"
-    chmod +x "$launcher"
-    printf '      -> written\n'
-  else
-    printf '      (dry-run)\n'
+    [ -f "$launcher" ] && cp -p "$launcher" "$launcher.bak"
+    tmp="$(mktemp "$gamedir/.launcher.XXXXXX")"
+    printf '%s\n' "$want" > "$tmp"
+    chmod +x "$tmp"
+    mv -f "$tmp" "$launcher"
   fi
-  rm -f "$tmp"
 }
 
-echo "Template: $TEMPLATE"
-echo "Mode:     $([ "$APPLY" -eq 1 ] && echo APPLY || echo DRY-RUN)"
+echo "Mode: $([ "$APPLY" -eq 1 ] && echo APPLY || echo DRY-RUN)"
 echo
 
 if [ -n "$TARGET" ]; then
-  gamedir="$QROOT/$TARGET"
-  [ -d "$gamedir" ] || { echo "Error: no such game: $gamedir" >&2; exit 1; }
-  regenerate_one "$gamedir"
+  case "$TARGET" in ""|*/*|.|..) echo "Error: invalid game name '$TARGET'" >&2; exit 1 ;; esac
+  [ -d "$QROOT/$TARGET/game" ] || { echo "Error: no such game: $QROOT/$TARGET" >&2; exit 1; }
+  update_one "$(readlink -f "$QROOT/$TARGET")"
 else
   n=0
   for d in "$QROOT"/*/; do
     g="${d%/}"
-    case "$(basename "$g")" in _umu-cache|_umu-data|_sandbox_probe) continue ;; esac
+    case "$(basename "$g")" in _*|.*|wq-ui) continue ;; esac
     [ -d "$g/game" ] || continue
-    regenerate_one "$g" || true
+    update_one "$(readlink -f "$g")" || true
     n=$((n+1))
   done
   echo
-  echo "Processed $n game(s)."
+  echo "Checked $n game(s)."
 fi
 
-[ "$APPLY" -eq 0 ] && echo && echo "Dry-run complete. Use --apply to write."
+[ "$APPLY" -eq 0 ] && { echo; echo "Dry-run only. Use --apply to write."; }
+exit 0

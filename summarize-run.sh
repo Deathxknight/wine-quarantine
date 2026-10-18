@@ -3,6 +3,7 @@
 GAMEDIR="$1"
 ALERTLOG="$2"
 GAME_RC="${3:-0}"   # optional: exit code of the sandboxed process
+case "$GAME_RC" in ''|*[!0-9]*) GAME_RC=0 ;; esac
 
 # leaks reported from INSIDE the jail (reachability tests, native preflight).
 # these land in the launch log, not the monitor's alert log, so look there too.
@@ -14,16 +15,32 @@ LEAK_COUNT=0
 
 RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'; BOLD='\033[1m'; NC='\033[0m'
 
-ALERTS=$(grep "\[ALERT\]" "$ALERTLOG" 2>/dev/null)
-WARNS=$(grep "\[WARN\]" "$ALERTLOG" 2>/dev/null)
-RUNTIME_INFO=$(grep "Runtime component installed" "$ALERTLOG" 2>/dev/null)
+ALERTS=$(grep "\[ALERT\]" "$ALERTLOG" 2>/dev/null || true)
+WARNS=$(grep "\[WARN\]" "$ALERTLOG" 2>/dev/null || true)
+RUNTIME_INFO=$(grep "Runtime component installed" "$ALERTLOG" 2>/dev/null || true)
 
-ALERT_COUNT=$(echo -n "$ALERTS" | grep -c "^" 2>/dev/null || echo 0)
-WARN_COUNT=$(echo -n "$WARNS" | grep -c "^" 2>/dev/null || echo 0)
-RUNTIME_COUNT=$(echo -n "$RUNTIME_INFO" | grep -c "^" 2>/dev/null || echo 0)
-[ -z "$ALERTS" ] && ALERT_COUNT=0
-[ -z "$WARNS" ] && WARN_COUNT=0
-[ -z "$RUNTIME_INFO" ] && RUNTIME_COUNT=0
+count_lines() { [ -n "$1" ] && printf '%s\n' "$1" | grep -c '^' || echo 0; }
+WARN_COUNT=$(count_lines "$WARNS")
+RUNTIME_COUNT=$(count_lines "$RUNTIME_INFO")
+
+# One finding is one alert. These ALERT lines only describe another alert (the kill switch firing
+# because of one, ClamAV's totals line after its per-file lines), so they are listed but not counted.
+ALERT_COUNT=0
+if [ -n "$ALERTS" ]; then
+  ALERT_COUNT=$(printf '%s\n' "$ALERTS" | grep -Evc 'Kill switch triggered|ClamAV flagged [0-9]+ of|ClamAV: \.\.\. and [0-9]+ more|No terminal emulator found' || true)
+  [ "$ALERT_COUNT" -gt 0 ] || ALERT_COUNT=1
+fi
+
+# the preflight failed and the game never ran: exit 90/91 (verify-sandbox.sh) or 97 (native), and the
+# launch log says so. The marker matters because a game may use those exit codes itself.
+BLOCKED=0; BLOCK_WHY=""
+if [ -n "$LAUNCHLOG_LATEST" ]; then
+  case "$GAME_RC" in
+    90|91|97)
+      BLOCK_WHY=$(sed 's/\x1b\[[0-9;]*m//g' "$LAUNCHLOG_LATEST" 2>/dev/null | grep -E 'SANDBOX-VERIFY\] FAIL|wq: SANDBOX LEAK' | sort -u)
+      grep -qE 'SANDBOX-VERIFY\] (FAIL|ABORT)|wq: aborting launch' "$LAUNCHLOG_LATEST" 2>/dev/null && BLOCKED=1 ;;
+  esac
+fi
 
 # find newest regdiff log for this run, if any
 LATEST_REGDIFF=$(ls -t "$GAMEDIR/logs"/regdiff-*.log 2>/dev/null | head -n1)
@@ -45,8 +62,8 @@ echo
 
 if [ "$LEAK_COUNT" -gt 0 ]; then
   echo -e "${RED}${BOLD}VERDICT: SANDBOX LEAK${NC} — the jail exposed $LEAK_COUNT thing(s) to the game."
-elif [ "$GAME_RC" -eq 97 ]; then
-  echo -e "${RED}${BOLD}VERDICT: LAUNCH BLOCKED${NC} — preflight check failed, the game never ran."
+elif [ "$BLOCKED" -eq 1 ]; then
+  echo -e "${RED}${BOLD}VERDICT: LAUNCH BLOCKED${NC} — a preflight check failed, the game never ran."
 elif [ "$ALERT_COUNT" -eq 0 ] && [ "$WARN_COUNT" -eq 0 ]; then
   echo -e "${GRN}${BOLD}VERDICT: CLEAN${NC} — no suspicious activity detected."
 elif [ "$ALERT_COUNT" -eq 0 ]; then
@@ -59,6 +76,12 @@ echo
 if [ "$LEAK_COUNT" -gt 0 ]; then
   echo -e "${RED}--- Sandbox leaks ---${NC}"
   printf '%s\n' "$LEAKS" | sed 's/^/  /'
+  echo
+fi
+
+if [ "$BLOCKED" -eq 1 ] && [ -n "$BLOCK_WHY" ]; then
+  echo -e "${RED}--- Why it was blocked ---${NC}"
+  printf '%s\n' "$BLOCK_WHY" | sed 's/^/  /'
   echo
 fi
 

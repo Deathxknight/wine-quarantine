@@ -488,7 +488,8 @@ apply_game_profile() {
     # what verify-sandbox.sh should expect (set outside the sandbox, read once
     # by the verifier before the game starts)
     export QVERIFY_NET="$mode"
-    QVERIFY_SKIP="$(IFS=,; echo "${skip[*]:-}")"
+    # WQ_VERIFY_SKIP_EXTRA (config.local.sh): extra checks to skip on every game, e.g. "propagation"
+    QVERIFY_SKIP="$(IFS=,; echo "${skip[*]:-}${WQ_VERIFY_SKIP_EXTRA:+${skip[*]:+,}$WQ_VERIFY_SKIP_EXTRA}")"
     export QVERIFY_SKIP
 
     # --- launch scripts (host side, per game) --------------------------------

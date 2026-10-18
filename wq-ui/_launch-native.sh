@@ -46,11 +46,16 @@ case "$EXE_NAME" in *.sh) ;; *) chmod u+x "$EXEDIR/$EXE_NAME" ;; esac
 LOGDIR="$GAMEDIR/logs"; mkdir -p "$LOGDIR"
 ALERTLOG="$LOGDIR/alerts-$(date +%Y%m%d-%H%M%S).log"
 LAUNCHLOG="$LOGDIR/launch-$(date +%Y%m%d-%H%M%S).log"
-exec > >(tee -a "$LAUNCHLOG") 2>&1
+# (the logger ignores TERM/INT/HUP so it outlives a Stop and the post-run summary can still print)
+exec > >(trap '' TERM INT HUP; tee -a "$LAUNCHLOG") 2>&1
+# Stop in the app signals this whole process group: the sandbox and monitor die, this script
+# carries on to the home diff, the ClamAV scan and the verdict.
+STOP_REQUESTED=0
+trap 'STOP_REQUESTED=1' TERM INT HUP
 find "$LOGDIR" -maxdepth 1 -type f \( -name 'alerts-*.log' -o -name 'launch-*.log' \) \
   -mtime +"${LOG_RETENTION_DAYS:-30}" -delete 2>/dev/null || true
 
-echo "wq: native launch of $GAMENAME ($EXE). verify-sandbox.sh is not run for native games."
+echo "wq: native launch of $GAMENAME ($EXE)."
 
 export WQ_RUNNER=native
 WQ_LIMITS_SUPPORTED=1   # the firejail call below uses WQ_LIMIT_PREFIX
@@ -82,6 +87,16 @@ post_run() {   # post_run <game exit code>
 }
 
 WL_ARGS=("--whitelist=$GAMEDIR/game" "--read-write=$GAMEDIR/game")
+# the verifier and its hash go into the jail read-only, as for Windows games
+WQ_NATIVE_VERIFY=0
+if [ "${NATIVE_VERIFY:-1}" = 1 ] && [ -f "$QROOT/verify-sandbox.sh" ] && [ -f "$QROOT/verify-sandbox.sha256" ]; then
+  WQ_NATIVE_VERIFY=1
+  _qr="$(readlink -f "$QROOT")"
+  for _f in verify-sandbox.sh verify-sandbox.sha256; do
+    WL_ARGS+=("--whitelist=$_qr/$_f" "--read-only=$_qr/$_f")
+  done
+fi
+export WQ_NATIVE_VERIFY QVERIFY_MODE=native QVERIFY_GAMEDIR="$GAMEDIR"
 mapfile -t -O "${#WL_ARGS[@]}" WL_ARGS < <(profile_extra_whitelist_args)
 mapfile -t BL_ARGS < <(build_blacklist_args)
 
@@ -94,7 +109,11 @@ ${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u
   firejail "${FJ_ARGS[@]}" "${WL_ARGS[@]}" "${BL_ARGS[@]}" -- \
     bash -c '
       # preflight: refuse to start the game if the jail is leaking (honours the
-      # profile opt-outs in QVERIFY_SKIP). verify-sandbox.sh is Wine-specific.
+      # profile opt-outs in QVERIFY_SKIP). First the generic verifier (capabilities, seccomp,
+      # network, ...), then the extra native checks below.
+      if [ "${WQ_NATIVE_VERIFY:-0}" = 1 ]; then
+        "$0/verify-sandbox.sh" || exit $?
+      fi
       bad=0; sk=",${QVERIFY_SKIP:-},"
       has() { case "$sk" in *",$1,"*) return 1 ;; *) return 0 ;; esac; }
       leak() { echo "wq: SANDBOX LEAK: $*" >&2; bad=1; }
@@ -130,7 +149,7 @@ ${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u
         *.sh) exec bash "./$WQ_EXE_NAME" ;;
         *)    exec "./$WQ_EXE_NAME" ;;
       esac
-    ' &
+    ' "$QROOT" &
 GAME_PID=$!
 
 # Start the monitor at once. A native game is running within milliseconds, and whatever it does in
@@ -140,7 +159,10 @@ GAME_PID=$!
 MONITOR_PID=$!
 
 GAME_RC=0
-wait "$GAME_PID" || GAME_RC=$?
+while :; do
+  GAME_RC=0; wait "$GAME_PID" || GAME_RC=$?      # (|| keeps set -e from ending the script)
+  kill -0 "$GAME_PID" 2>/dev/null || break
+done
 echo "wq: game exited with code $GAME_RC"
 for _ in 1 2 3 4 5; do kill -0 "$MONITOR_PID" 2>/dev/null || break; sleep 1; done
 wait "$MONITOR_PID" 2>/dev/null || true

@@ -147,7 +147,7 @@ echo fresh > "$g/prefix/new.dll"
 out="$(scan sc --when run --alertlog "$AL")";                  has "incremental scan" 'changed since last scan' "$out"
 eq "only the changed file is scanned" "$g/prefix/new.dll" "$(cat "$T/list.txt")"
 touch -d '10 days ago' "$g/.clam-fullstamp"
-out="$(scan sc --when run --alertlog "$AL")";                  has "periodic full rescan" '\(full\)' "$out"
+out="$(scan sc --when run --alertlog "$AL")";                  has "periodic full rescan" '\(full[,)]' "$out"
 eq "full rescan lists everything" 3 "$(wc -l < "$T/list.txt")"
 
 echo 'X5O!P%@AP EICAR-TEST' > "$g/prefix/drive_c_dropper.dll"
@@ -262,7 +262,7 @@ echo 'X5O EICAR-TEST' > "$HOME/dropped.bin"
 sleep 3
 exit 7
 EOS
-out="$(cd "$T" && PATH="$BIN:$PATH" POLL_INTERVAL=1 LOG_FLUSH_INTERVAL=1 ALERT_TERMINAL=/bin/true \
+out="$(cd "$T" && PATH="$BIN:$PATH" POLL_INTERVAL=1 LOG_FLUSH_INTERVAL=1 ALERT_TERMINAL=/bin/true NATIVE_VERIFY=0 \
        CLAM_BIN="$STUB" CLAM_DB_DIR="$DB" CLAM_SANDBOX=0 \
        "$gl/launch-quarantine.sh" 2>&1)"; rc=$?
 eq "launcher passes on the game's exit code" 7 "$rc"

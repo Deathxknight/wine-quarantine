@@ -52,7 +52,10 @@ REQUIRED_BINS=(firejail inotifywait python3)
 : "${CLAM_EXCLUDE_REGEX:=}"       # extended regex, matching paths are not scanned
 ALERT_TERMINAL="${ALERT_TERMINAL:-}"
 
-POLL_INTERVAL="${POLL_INTERVAL:-5}"
+POLL_INTERVAL="${POLL_INTERVAL:-2}"   # a process is only inspected once seen on two polls, so this is the shortest life it can be caught in x2
+# native games also run verify-sandbox.sh (generic checks) inside the jail before the game starts.
+# 0 turns it off, e.g. if a check blocks a setup that is fine; the inline preflight still runs.
+NATIVE_VERIFY="${NATIVE_VERIFY:-1}"
 LOG_FLUSH_INTERVAL="${LOG_FLUSH_INTERVAL:-2}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 
@@ -106,11 +109,6 @@ check_deps() {
   elif [ ! -x "$LUTRIS_UMU" ]; then
     missing+=("$LUTRIS_UMU  (umu-run, not executable)")
   fi
-  if [ -z "$STEAM_ROOT" ]; then
-    :
-  elif [ ! -d "$STEAM_ROOT" ]; then
-    :
-  fi
   [ -d "$QROOT" ] || missing+=("$QROOT  (quarantine root, not a directory)")
   local pp ph
   pp="$(find_proton "" 2>/dev/null || true)"
@@ -148,7 +146,7 @@ detect_parent_terminal() {
       xfce4-terminal)   echo xfce4-terminal; return 0 ;;
       xterm)            echo xterm;          return 0 ;;
     esac
-    pid="$(awk '{ sub(/^[^)]*\) /,""); print $2 }' "/proc/$pid/stat" 2>/dev/null)"
+    pid="$(awk '{ sub(/^.*\) /,""); print $2 }' "/proc/$pid/stat" 2>/dev/null)"
   done
   return 1
 }
@@ -164,7 +162,7 @@ detect_terminal() {
   fi
   local t
   for t in kitty alacritty foot wezterm ghostty konsole xterm \
-           x-terminal-emulator gnome-terminal konsole xfce4-terminal; do
+           x-terminal-emulator gnome-terminal xfce4-terminal; do
     command -v "$t" >/dev/null 2>&1 && { echo "$t"; return 0; }
   done
   return 1
@@ -181,13 +179,13 @@ find_proton() {
   if [ -n "$PROTON_PREFERRED" ] && [ -f "$PROTON_PREFERRED/toolmanifest.vdf" ]; then
     readlink -f "$PROTON_PREFERRED"; return 0
   fi
+  # newest build in the first search dir that has any (version sort: 10-9 < 10-10)
   local d cand
   for d in "${PROTON_SEARCH_DIRS[@]}"; do
     [ -d "$d" ] || continue
-    for cand in "$d"/*/toolmanifest.vdf; do
-      [ -f "$cand" ] || continue
-      readlink -f "$(dirname "$cand")"; return 0
-    done
+    cand="$(for c in "$d"/*/toolmanifest.vdf; do [ -f "$c" ] && dirname "$c"; done | sort -V | tail -n1)"
+    [ -n "$cand" ] || continue
+    readlink -f "$cand"; return 0
   done
   return 1
 }
@@ -281,14 +279,32 @@ build_whitelist_args() {
 }
 
 # term_run <terminal> <title> <class|""> <cmd> [args...]
-# xterm needs -T / -class / -e; everything else keeps the old --title style.
+# Terminals disagree on how to set a title/class and how to pass the command.
 term_run() {
   local term="$1" title="$2" class="$3"; shift 3
   case "$(basename "$term")" in
-    xterm|uxterm) "$term" -T "$title" ${class:+-class "$class"} -e "$@" ;;
-    konsole)      "$term" -p "tabtitle=$title" -e "$@" ;;
-    *)            "$term" --title "$title" ${class:+--class "$class"} "$@" ;;
+    xterm|uxterm)    "$term" -T "$title" ${class:+-class "$class"} -e "$@" ;;
+    konsole)         "$term" -p "tabtitle=$title" -e "$@" ;;
+    kitty)           "$term" --title "$title" ${class:+--class "$class"} "$@" ;;
+    foot)            "$term" --title "$title" ${class:+--app-id "$class"} "$@" ;;
+    alacritty)       "$term" --title "$title" ${class:+--class "$class"} -e "$@" ;;
+    ghostty)         "$term" --title="$title" -e "$@" ;;
+    wezterm)         "$term" start ${class:+--class "$class"} -- "$@" ;;
+    gnome-terminal)  "$term" --title="$title" -- "$@" ;;
+    xfce4-terminal)  "$term" --title "$title" -x "$@" ;;
+    *)               "$term" -T "$title" -e "$@" ;;   # x-terminal-emulator and anything unknown
   esac
+}
+
+# The per-game launch-quarantine.sh is a thin wrapper that resolves everything from its own
+# location, so a launcher fix never needs a per-game rewrite. One definition, used by
+# new-quarantine.sh, wq-ui/new-native.sh and update-launchers.sh.
+wq_launcher_text() {   # wq_launcher_text <windows|native>
+  local core='_launch-core.sh'
+  [ "${1:-}" = native ] && core='wq-ui/_launch-native.sh'
+  printf '%s\n' '#!/bin/bash' \
+    'D="$(dirname "$(readlink -f "$0")")"' \
+    "exec \"\$(dirname \"\$D\")/$core\" \"\$(basename \"\$D\")\""
 }
 
 # wq-ui integration: per-game firejail profiles

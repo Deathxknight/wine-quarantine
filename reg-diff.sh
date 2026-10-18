@@ -8,7 +8,43 @@ SNAPDIR="$GAMEDIR/.reg-snapshot"
 PREFIX="$GAMEDIR/prefix"
 REGFILES="system.reg user.reg userdef.reg"
 
-PERSIST_PATHS='Run|RunOnce|RunServices|Image File Execution Options|AppInit_DLLs|Winlogon|Classes\\\\CLSID|Services|Browser Helper Objects|Policies\\\\Explorer\\\\Run|BootExecute'
+# Wine writes a registry as
+#   [Software\\Microsoft\\Windows\\CurrentVersion\\Run] 1699999999
+#   #time=1da0123456789ab
+#   "Name"="C:\\path\\game.exe"
+# (key paths have DOUBLED backslashes, and every key header is followed by a #time line, so the
+# first value is the second line after the header, not the first). A plain diff cannot say which
+# key a changed value line belongs to, so both files are flattened to "key<TAB>value" lines first.
+BS='\\\\'    # ERE for two literal backslashes
+PERSIST_NAMES='Run|RunOnce|RunServices|RunServicesOnce|Image File Execution Options|AppInit_DLLs|Winlogon|ShellServiceObjectDelayLoad|SharedTaskScheduler|AppCertDlls|SilentProcessExit|KnownDLLs|Browser Helper Objects'
+# a key path segment, not a substring: Software\\Foo\\Runtime must not count as ...\\Run
+PERSIST_RE="(^|$BS)($PERSIST_NAMES)($BS|\$)"
+# value names that hijack loading or startup wherever they sit (empty ones are just Wine's defaults)
+PERSIST_VALUE_RE='^"(AppInit_DLLs|Userinit|BootExecute)"='
+SERVICE_KEY_RE="${BS}CurrentControlSet${BS}Services${BS}[^\\\\]+\$"
+REMOVED_KEY_RE="(^|$BS)(Image File Execution Options|Winlogon|AppInit_DLLs|BootExecute)($BS|\$)|${BS}CurrentControlSet${BS}Services\$"
+
+flatten_reg() {   # K<TAB>key  /  V<TAB>key<TAB>value (continuation lines joined)
+  awk '
+    function flush() { if (cur != "") { print "V\t" key "\t" cur; cur = "" } }
+    /^\[/ { flush(); k = $0; sub(/^\[/, "", k); sub(/\] [0-9]+[ \t\r]*$/, "", k); key = k; print "K\t" key; next }
+    /^[ \t]+[^ \t]/ { if (cur != "") { sub(/^[ \t]+/, ""); sub(/\r$/, ""); cur = cur $0 } next }
+    /^[#;]/ || /^[ \t\r]*$/ || /^WINE REGISTRY/ { flush(); next }
+    { flush(); sub(/\r$/, ""); cur = $0 }
+    END { flush() }
+  ' "$1"
+}
+
+# persist_hits <added-entries-file>: autostart / hijack entries among the newly added ones
+persist_hits() {
+  RE="$PERSIST_RE" VRE="$PERSIST_VALUE_RE" SRE="$SERVICE_KEY_RE" awk -F'\t' '
+    $1 != "V" { next }
+    { key = tolower($2); val = tolower($3) }
+    key ~ tolower(ENVIRON["RE"])                                   { print $2 "\t" $3; next }
+    val ~ tolower(ENVIRON["VRE"]) && val !~ /=""$/                 { print $2 "\t" $3; next }
+    key ~ tolower(ENVIRON["SRE"]) && val ~ /^"imagepath"=/ && val !~ /system32/ { print $2 "\t" $3 }
+  ' "$1"
+}
 
 case "$MODE" in
   snapshot)
@@ -56,22 +92,34 @@ case "$MODE" in
       # Count the diff shape
       ADDED=$(echo "$DIFF"   | grep -c '^> ' || true)
       REMOVED=$(echo "$DIFF" | grep -c '^< ' || true)
-      CHANGED=$(echo "$DIFF" | grep -c '^[<>] ' || true)
 
-      # Persistence keys
-      PERSIST_HITS=$(echo "$DIFF" \
-        | grep -A1 -iE "^> \[.*\\\\($PERSIST_PATHS)" \
-        | grep -E '^\> ".*"=')
-      if [ -n "$PERSIST_HITS" ]; then
-        log ALERT "Persistence key written in $f: $PERSIST_HITS"
+      # Persistence: compare what each key holds, so a value added to a key that already
+      # existed is caught too, not only a brand new key
+      TMP="$(mktemp -d)"
+      flatten_reg "$BEFORE" | sort -u > "$TMP/before"
+      flatten_reg "$AFTER"  | sort -u > "$TMP/after"
+      comm -13 "$TMP/before" "$TMP/after" > "$TMP/added"
+      comm -23 "$TMP/before" "$TMP/after" > "$TMP/removed"
+      persist_hits "$TMP/added" > "$TMP/hits"
+      NHITS=$(grep -c '' "$TMP/hits")
+      if [ "$NHITS" -gt 0 ]; then
+        head -n 5 "$TMP/hits" | while IFS=$'\t' read -r hk hv; do
+          hk="${hk//[[:cntrl:]]/}"; hv="${hv//[[:cntrl:]]/}"
+          log ALERT "Persistence key written in $f: [${hk:0:160}] ${hv:0:160}"
+        done
+        [ "$NHITS" -gt 5 ] && log WARN "$((NHITS - 5)) more persistence entries in $f - see $DIFFLOG"
+        { echo "--- persistence entries in $f ---"; cat "$TMP/hits"; echo; } >> "$DIFFLOG"
+        rm -rf "$TMP"
         continue
       fi
 
-      # system32
-      if echo "$DIFF" | grep -qiE '^< \[.*\\\\(Image File Execution Options|Winlogon|Services|AppInit_DLLs|BootExecute)'; then
+      # security-relevant keys that disappeared
+      if awk -F'\t' '$1 == "K" { print $2 }' "$TMP/removed" | grep -qiE "$REMOVED_KEY_RE"; then
+        rm -rf "$TMP"
         log ALERT "Security-relevant key removed in $f — see $DIFFLOG"
         continue
       fi
+      rm -rf "$TMP"
 
       log INFO "Registry changed in $f (+$ADDED / -$REMOVED) — see $DIFFLOG"
     done
