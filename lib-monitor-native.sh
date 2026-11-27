@@ -30,10 +30,25 @@ NATIVE_NET_CODE_RE='(socket|pty\.spawn|child_process|fsockopen|TCPSocket|os\.dup
 NATIVE_MALNAME_RE='(reverse[_ -]?shell|revshell|keylog|backdoor|stealer|ransom|rootkit|meterpreter|mimikatz|webshell|botnet|cryptolocker|trojan)|(^|[^a-z])rat([^a-z]|$)'
 NATIVE_WEAKNAME_RE='(payload|exploit|dropper|implant|beacon|spawner)'
 
-# native_classify_proc <exe_basename> <argv0_basename> <cmdline> [exe_link] [script_basename]
+# Shells and interpreters, matched on the KERNEL's name for the program (/proc/PID/exe, comm), never on argv[0]:
+# a symlink called "helper" that points at /bin/sh, or a "#!/bin/sh" script run through such a link, has no
+# interpreter name anywhere in its argv.
+NATIVE_SHELL_RE='^(bash|sh|dash|zsh|ksh|ash|busybox)$'
+
+# native_is_tmp <path>: a world-writable scratch directory (AppImage / PyInstaller / Chromium unpack dirs excluded)
+native_is_tmp() {
+  case "$1" in
+    /tmp/.mount_*|/tmp/_MEI*|/tmp/appimage_extracted_*|/tmp/.org.chromium.*) return 1 ;;
+    /tmp|/tmp/*|/var/tmp|/var/tmp/*|/dev/shm|/dev/shm/*) return 0 ;;
+  esac
+  return 1
+}
+
+# native_classify_proc <exe_basename> <argv0_basename> <cmdline> [exe_link] [script_basename] [cwd] [script_path]
 # script_basename is the file an interpreter was told to run (bash start.sh -> start.sh), when there is one.
+# cwd and script_path (full path) are used for the temp-directory rules.
 native_classify_proc() {
-  local exe="$1" a0="$2" cmd="$3" link="${4:-}" scr="${5:-}" n lscr
+  local exe="$1" a0="$2" cmd="$3" link="${4:-}" scr="${5:-}" cwd="${6:-}" spath="${7:-}" n lscr
   if [ -n "$scr" ]; then
     scr="${scr##*/}"; lscr="${scr,,}"
     if [[ "$lscr" =~ $NATIVE_MALNAME_RE ]]; then
@@ -78,6 +93,21 @@ native_classify_proc() {
     /tmp/*|/dev/shm/*|/var/tmp/*)
       printf 'WARN\tplain\tRunning a binary from a temp directory: %s\n' "$link"; return 0 ;;
   esac
+
+  # shells and interpreters working out of a temp directory (keyed on the kernel name, see NATIVE_SHELL_RE)
+  if [[ "$exe" =~ $NATIVE_SHELL_RE ]] || [[ "$exe" =~ $NATIVE_INTERP_RE ]]; then
+    if [ -n "$spath" ] && native_is_tmp "$spath"; then
+      printf 'WARN\tplain\tScript run from a temp directory (%s): %s\n' "$exe" "$spath"; return 0
+    fi
+    if [[ "$exe" =~ $NATIVE_SHELL_RE ]] && [[ "$cmd" =~ [[:space:]]-[a-z]*c[[:space:]] ]]; then
+      if [ -n "$cwd" ] && native_is_tmp "$cwd"; then
+        printf 'WARN\tplain\tShell command run from a temp directory (%s): cwd %s\n' "$exe" "$cwd"; return 0
+      fi
+      if [[ "$cmd" =~ (/tmp|/var/tmp|/dev/shm)/[^[:space:]\'\"]* ]] && native_is_tmp "${BASH_REMATCH[0]}"; then
+        printf 'WARN\tplain\tShell command that uses a temp directory path (%s): %s\n' "$exe" "${BASH_REMATCH[0]}"; return 0
+      fi
+    fi
+  fi
 
   for n in "$exe" "$a0"; do
     [ -n "$n" ] || continue
@@ -150,17 +180,29 @@ native_is_elf() {
   [ "$m" = $'\x7f'ELF ]
 }
 
-# native_classify_path <file> <inotify events> <effective home> <game dir>
+# native_has_shebang <file>: starts with "#!"
+native_has_shebang() {
+  local m=""
+  [ -f "$1" ] && [ -r "$1" ] || return 1
+  { LC_ALL=C IFS= read -r -N 2 m < "$1"; } 2>/dev/null || true
+  [ "$m" = '#!' ]
+}
+
+# native_classify_path <file> <inotify events> <effective home> <game dir> [<temp prefix>]
 # <home> is where the game thinks $HOME is (<game>/home with a private home, otherwise the real
-# $HOME). <game dir> is <game>/game.
+# $HOME). <game dir> is <game>/game. <temp prefix> is where the game's own /tmp, /var/tmp and /dev/shm can be
+# reached from the monitor (/proc/<pid>/root), so a file under <prefix>/tmp/... is judged as /tmp/...
+# The file rules look at what a file IS (execute bit, "#!" line, ELF header) as well as what it is called: a
+# script renamed notes.txt is still a script.
 native_classify_path() {
-  local file="$1" event="$2" home="$3" gamebin="$4" rel="" base lbase where=""
+  local file="$1" event="$2" home="$3" gamebin="$4" tmpfx="${5:-}" rel="" base lbase where="" shown disp
   base="${file##*/}"; lbase="${base,,}"
   case "$event" in *ISDIR*) return 0 ;; esac
 
   if [ -n "$home" ] && [[ "$file" == "$home"/* ]]; then
     rel="${file#"$home"/}"
     where="home"
+    shown="$rel"
     if [[ "$rel" =~ $NATIVE_RC_RE ]]; then
       printf 'ALERT\trc\tShell/session startup file written: ~/%s (%s)\n' "$rel" "$event"; return 0
     fi
@@ -180,23 +222,42 @@ native_classify_path() {
     esac
   elif [ -n "$gamebin" ] && [[ "$file" == "$gamebin"/* ]]; then
     where="game folder"
+    shown="${file#"$gamebin"/}"
+  elif [ -n "$tmpfx" ] && [[ "$file" =~ ^"$tmpfx"/(tmp|var/tmp|dev/shm)/ ]]; then
+    disp="${file#"$tmpfx"}"
+    # the X sockets, and the unpack dirs of AppImage / PyInstaller / Chromium, are not the game dropping files
+    case "$disp" in /tmp/.X11-unix/*|/tmp/.ICE-unix/*|/tmp/.XIM-unix/*|/tmp/.font-unix/*) return 0 ;; esac
+    native_is_tmp "$disp" || return 0
+    where="temp dir"
+    shown="$disp"
   else
     return 0
   fi
 
   # new code appearing at runtime
-  # Judge it once it's fully written: a CREATE is always followed by a CLOSE_WRITE and the file is
-  # still empty at CREATE time, so this reports each dropped file once.
-  case "$event" in *CLOSE_WRITE*|*MOVED_TO*) ;; *) return 0 ;; esac
+  # Judge it once it's fully written (CLOSE_WRITE / MOVED_TO), or when its mode changes (ATTRIB: chmod +x on a
+  # file that was written earlier). The caller reports each file once.
+  case "$event" in *CLOSE_WRITE*|*MOVED_TO*|*ATTRIB*) ;; *) return 0 ;; esac
   [ -f "$file" ] || return 0
   if native_is_elf "$file"; then
-    printf 'WARN\tplain\tNew executable (ELF) written in %s: %s (%s)\n' "$where" "${rel:-${file#"$gamebin"/}}" "$event"; return 0
+    printf 'WARN\tplain\tNew executable (ELF) written in %s: %s (%s)\n' "$where" "$shown" "$event"; return 0
   fi
   case "$lbase" in
     *.desktop|*.service|*.timer|*.socket|*.path)
-      printf 'WARN\tplain\tLauncher/unit file written in %s: %s (%s)\n' "$where" "${rel:-${file#"$gamebin"/}}" "$event"; return 0 ;;
+      printf 'WARN\tplain\tLauncher/unit file written in %s: %s (%s)\n' "$where" "$shown" "$event"; return 0 ;;
     *.sh|*.bash|*.zsh|*.py|*.pl|*.rb|*.run|*.appimage|*.bin)
-      printf 'WARN\tplain\tNew script/executable written in %s: %s (%s)\n' "$where" "${rel:-${file#"$gamebin"/}}" "$event"; return 0 ;;
+      printf 'WARN\tplain\tNew script/executable written in %s: %s (%s)\n' "$where" "$shown" "$event"; return 0 ;;
   esac
+  # what the file is, whatever it is called
+  local sb=0 xb=0
+  native_has_shebang "$file" && sb=1
+  [ -x "$file" ] && xb=1
+  if [ "$sb" = 1 ] && [ "$xb" = 1 ]; then
+    printf 'WARN\tplain\tExecutable script (#! line + execute bit) under an ordinary name, written in %s: %s (%s)\n' "$where" "$shown" "$event"
+  elif [ "$sb" = 1 ]; then
+    printf 'WARN\tplain\tScript (#! line) under an ordinary name, written in %s: %s (%s)\n' "$where" "$shown" "$event"
+  elif [ "$xb" = 1 ]; then
+    printf 'WARN\tplain\tFile with execute permission under an ordinary name, written in %s: %s (%s)\n' "$where" "$shown" "$event"
+  fi
   return 0
 }

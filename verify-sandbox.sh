@@ -51,6 +51,7 @@ fi
 
 PASS=0
 FAIL=0
+DEGRADED=0
 
 pass() { echo "[SANDBOX-VERIFY] ok:   $*" >&2; PASS=$((PASS+1)); }
 fail() { echo "[SANDBOX-VERIFY] FAIL: $*" >&2; FAIL=$((FAIL+1)); }
@@ -436,7 +437,33 @@ for sub in "${SUBDIRS[@]}"; do
   fi
 done
 
-echo "[SANDBOX-VERIFY] $PASS passed, $FAIL failed" >&2
+# supplementary groups: firejail silently ignores --nogroups on some systems (NVIDIA: "Warning: NVIDIA card detected,
+# nogroups command ignored"). The profile asked for it, so a game that still has docker/input/disk/... group membership
+# is a setting that is not in effect. Fail closed like every other check; WQ_NOGROUPS_STRICT=0 (set outside the sandbox)
+# turns it into a DEGRADED line that the run summary reports instead of cancelling the launch.
+if skipped groups; then
+  pass "supplementary groups check skipped by profile"
+else
+  PRIMARY_GID="$(id -g)"; EXTRA_GROUPS=""
+  read -ra GIDS <<< "$(id -G)"; read -ra GNAMES <<< "$(id -nG 2>/dev/null)"
+  for i in "${!GIDS[@]}"; do
+    [ "${GIDS[$i]}" = "$PRIMARY_GID" ] || [ "${GIDS[$i]}" = 65534 ] || EXTRA_GROUPS="$EXTRA_GROUPS ${GNAMES[$i]:-${GIDS[$i]}}"
+  done
+  if [ -z "${EXTRA_GROUPS// /}" ]; then
+    pass "no supplementary groups (--nogroups in effect)"
+  elif [ "${QVERIFY_NOGROUPS_STRICT:-${WQ_NOGROUPS_STRICT:-1}}" = 1 ]; then
+    fail "--nogroups is requested but not in effect: still a member of:$EXTRA_GROUPS (firejail ignores it on NVIDIA systems; turn off 'Drop supplementary groups' for this game to accept that)"
+  else
+    DEGRADED=$((DEGRADED+1))
+    echo "[SANDBOX-VERIFY] DEGRADED: --nogroups is requested but not in effect: still a member of:$EXTRA_GROUPS" >&2
+  fi
+fi
+
+if [ "$DEGRADED" -gt 0 ]; then
+  echo "[SANDBOX-VERIFY] $PASS passed, $FAIL failed, $DEGRADED degraded" >&2
+else
+  echo "[SANDBOX-VERIFY] $PASS passed, $FAIL failed" >&2
+fi
 
 if [ "$FAIL" -gt 0 ]; then
   echo "[SANDBOX-VERIFY] ABORT: sandbox not enforced" >&2

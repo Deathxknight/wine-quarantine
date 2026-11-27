@@ -389,6 +389,49 @@ out="$(WQ_SKIP_SCAN=1 "$Q/wq-ui/new-native.sh" $'bad\nname' 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && ok || fail "new-native.sh refuses a newline in the name"
 [ ! -e "$Q/bad"* ] 2>/dev/null && ok || fail "no folder left behind by a refused name"
 
+echo "== audit fixes: content-based file rules, temp dirs, kernel-name shells, first-sight judging, home inventory, summary"
+# 1+2: what a file IS, not what it is called
+NH="$T/nh"; NG="$T/ng"; NR="$T/nroot"; mkdir -p "$NH/work" "$NG" "$NR/tmp" "$NR/tmp/.X11-unix"
+printf '#!/bin/sh\necho hi\n' > "$NH/notes.txt"; chmod +x "$NH/notes.txt"
+printf '#!/bin/sh\n' > "$NH/shebang.txt"; printf 'x' > "$NH/exec.dat"; chmod 755 "$NH/exec.dat"; printf 'just text\n' > "$NH/work/data.txt"
+r="$(native_classify_path "$NH/notes.txt" CLOSE_WRITE "$NH" "$NG")";   has "exec-bit script named .txt is flagged" 'WARN.*Executable script' "$r"
+r="$(native_classify_path "$NH/shebang.txt" CLOSE_WRITE "$NH" "$NG")"; has "shebang under a harmless name is flagged" 'WARN.*Script \(#! line\)' "$r"
+r="$(native_classify_path "$NH/exec.dat" ATTRIB "$NH" "$NG")";         has "chmod +x (ATTRIB) on an ordinary file is flagged" 'WARN.*execute permission' "$r"
+r="$(native_classify_path "$NH/work/data.txt" CLOSE_WRITE "$NH" "$NG")"; eq "plain data is not flagged" "" "$r"
+# 1: the game's own /tmp (seen through /proc/<pid>/root)
+cp "$NH/notes.txt" "$NR/tmp/.stage"; printf '#!x' > "$NR/tmp/.X11-unix/X0"
+r="$(native_classify_path "$NR/tmp/.stage" CLOSE_WRITE "$NH" "$NG" "$NR")"; has "script in the game's /tmp is flagged as /tmp/..." 'WARN.*temp dir: /tmp/\.stage' "$r"
+r="$(native_classify_path "$NR/tmp/.X11-unix/X0" CLOSE_WRITE "$NH" "$NG" "$NR")"; eq "X socket dir in /tmp is ignored" "" "$r"
+r="$(native_classify_path "$NR/tmp/.stage" CLOSE_WRITE "$NH" "$NG")"; eq "without a temp prefix /tmp is not watched (host files are not the game's)" "" "$r"
+# 3: shells are recognised by the kernel's name, not by argv
+r="$(native_classify_proc dash helper 'helper -c /tmp/.wq-1/stage2' /usr/bin/dash '' /tmp/.wq-1 '')"; has "symlinked sh -c from a temp cwd" 'WARN.*temp directory' "$r"
+r="$(native_classify_proc dash sh 'sh ./x.sh' /usr/bin/dash x.sh '' /tmp/.wq-1/x.sh)";                 has "script run from /tmp" 'WARN.*Script run from a temp directory' "$r"
+r="$(native_classify_proc bash bash 'bash -c echo hi' /usr/bin/bash '' /opt/game '')";                  eq "ordinary bash -c is still nothing" "" "$r"
+r="$(native_classify_proc bash bash 'bash -c /tmp/.mount_x/AppRun' /usr/bin/bash '' /opt/game '')";    eq "AppImage mount path is not a temp-dir hit" "" "$r"
+# 4: a child that lives 1.5s is inspected (it used to need two polls)
+gq="$(mkgame q1 native)"
+: > "$gq/logs/alerts-test.log"; out="$(run_monitor "$gq" "$BIN/ncat 1.5; true")"
+has "a 1.5s ncat child is caught (poll every 1s)" 'ALERT\] Suspicious process: ncat' "$out"
+# 5: arbitrary writes in the private home are listed
+gh="$(mkgame hd native)"; mkdir -p "$gh/home/work"; echo old > "$gh/home/work/keep.txt"
+( export WQ_MONITOR_HOME="$gh/home" WQ_MONITOR_PRIVATE=1; "$Q/home-diff.sh" snapshot "$gh"
+  echo x > "$gh/home/work/data.txt"; echo y >> "$gh/home/work/keep.txt"; mkdir -p "$gh/home/.cache"; echo c > "$gh/home/.cache/z"
+  "$Q/home-diff.sh" compare "$gh" "$gh/logs/a.log" ) > "$T/hd.out" 2>&1
+has "home diff reports other writes" 'Home diff: 1 other file\(s\) created, 1 modified' "$(cat "$T/hd.out")"
+has "details name the file" 'created +~/work/data\.txt' "$(cat "$gh"/logs/homediff-*.log)"
+hasnt "cache is not inventoried" '\.cache' "$(cat "$gh"/logs/homediff-*.log)"
+# 6+7: launch-log warnings reach the verdict
+gs="$(mkgame sm native)"; : > "$gs/logs/alerts-t.log"
+printf 'Warning: NVIDIA card detected, nogroups command ignored\nwq: not hiding /mnt: x lives under it\nwq: native launch of sm (start.sh).\n' > "$gs/logs/launch-20260101-000000.log"
+out="$("$Q/summarize-run.sh" "$gs" "$gs/logs/alerts-t.log" 0 2>&1)"
+hasnt "launch warnings mean it is not CLEAN" 'VERDICT: CLEAN' "$out"
+has "verdict is OK with launch warnings" 'VERDICT: OK, minor notes.*2 launch warning' "$out"
+has "the firejail warning is listed" 'Launch warnings.*' "$out"; has "nogroups warning listed" 'nogroups command ignored' "$out"; has "mnt warning listed" 'not hiding /mnt' "$out"
+has "degraded banner for an ignored setting" 'SANDBOX DEGRADED' "$out"
+hasnt "progress lines are not warnings" 'native launch of' "$out"
+printf '[2026-01-01 00:00:00] [INFO] Monitor coverage: 3 time(s) a child ran and exited between two polls\n' > "$gs/logs/alerts-t.log"
+has "coverage gaps are in the summary" 'Monitor coverage' "$("$Q/summarize-run.sh" "$gs" "$gs/logs/alerts-t.log" 0 2>&1)"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
