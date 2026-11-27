@@ -1,0 +1,9 @@
+# YARA rule NAMES that wq-yara.sh leaves out of the verdict (no warning, no alert, not counted).
+# One name per line:  <rule name>  # why.  The raw yara output (yara-*.log) still lists every match.
+# Put your own entries in yara-ignore.local.txt (same format), which survives project updates.
+# Use this for a rule you have checked and found it fires on clean files. To drop a whole rule FILE
+# from the build instead, use yara-skip.txt.
+#
+# Example:
+# golang_bin_JCorn_CSC846  # flags Wine's nvcuda.dll / d3d12.dll as Go binaries
+cobalt_strike_tmp01925d3f  # its $x2 is the wide string "api-ms-win-core-synch-l1-2-0.dll", which the rule's own comment calls a reversed goodware string, so any PE under 1000 KB that imports it matches: flags Proton's nvngx.dll and openvr_api_dxvk.dll (score 80, "high-risk") on every prefix upgrade

@@ -1,0 +1,48 @@
+rule:
+  meta:
+    name: run PowerShell expression
+    namespace: load-code/powershell/
+    authors:
+      - anamaria.martinezgom@mandiant.com
+    scopes:
+      static: function
+      dynamic: span of calls
+    att&ck:
+      - Execution::Command and Scripting Interpreter::PowerShell [T1059.001]
+    mbc:
+      - Execution::Command and Scripting Interpreter [E1059]
+    examples:
+      - 692f7fd6d198e804d6af98eb9e390d61:0x6000004
+  features:
+    - or:
+      - and:
+        - api: System.Management.Automation.PowerShell::Invoke
+        - or:
+          - api: System.Management.Automation.PowerShell::Create
+          - api: System.Management.Automation.PowerShell::AddScript
+          - api: System.Management.Automation.PowerShell::AddCommand
+          - api: System.Management.Automation.PowerShell::AddStatement
+
+      - and:
+        - or:
+          - string: /powershell(\.exe)?/i
+          - string: /pwsh(\.exe)?/i
+        - or:
+          - string: /\b-(e|en|enc|enco|encod|encodedcommand)\b/i
+          - string: /\biex\b/i
+          - string: /\bInvoke-Expression\b/i
+
+      - or:
+        - string: /\biex\s*\(/i
+        - string: /\biex\s+\$/i
+        - string: /\bInvoke-Expression\s*\(/i
+        - string: /\bInvoke-Expression\s+\$/i
+        - string: /\|\s*iex\b/i
+        - string: /\|\s*Invoke-Expression\b/i
+        - string: /\bDownloadString\s*\(/i
+        - string: /\b(iwr|curl|wget)\b/i
+        - string: /\bInvoke-WebRequest\s+/i
+        - string: /\bNew-Object\s+System\.Net\.WebClient/i
+        - string: /\bSystem\.Management\.Automation\.AmsiUtils\b/i
+        - string: /\bAmsiUtils\b/i
+        - string: /\bamsiInitFailed\b/i

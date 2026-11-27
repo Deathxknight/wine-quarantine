@@ -3,6 +3,11 @@
 *.bak-*
 .clam-fullstamp
 .clam-stamp*
+.yara-stamp*
+.yara-fullstamp
+.yara-infected
+/_yara-build/
+/_yara-feeds/
 config.local.sh
 */game/
 */home/
@@ -22,3 +27,6 @@ _umu-data/
 .wq-netfilter
 *.wq-orig
 .wq-patch-backup-*/
+/_sandbox-test/
+.sandbox-tests/
+/.trash/

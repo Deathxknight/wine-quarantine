@@ -1,0 +1,6 @@
+# Rule files wq-yara-build.sh leaves out because they flag clean files (false positives).
+# One entry per line:  <path relative to a rules folder>  # reason
+# Skipped files are listed in _yara-build/SKIPPED.txt. Add your own entries here, or in
+# yara-skip.local.txt (same format), which survives project updates.
+
+malware/RAT_PoetRATPython.yar  # broken upstream: /BADD|Bad Error Happened|/ has an empty alternative and matches every file, and /version|ls|cd|cp|mv|.../ matches ordinary text, so any file containing "Affine" (Wine's d3dx9/d3dx10 DLLs, dx8vb.dll) is flagged as high-risk

@@ -20,4 +20,48 @@ fi
 # Proton runs directly against the host libraries, inside the sandbox.
 export UMU_NO_RUNTIME=1
 
+# Proton's gamepad-UI helper (Xalia) starts its own SDL3 and dies with "No displays available" under a
+# private X server; it is no use in a sandbox with no controller. ProtonFixes tries to download its
+# manifests and fails with "Failed to download ... name resolution" (the sandbox has no DNS, correctly).
+# Both only add noise to the log, which makes real problems harder to spot. WQ_XALIA=1 / WQ_PROTONFIXES=1 turn them back on.
+[ "${WQ_XALIA:-0}" = 1 ]      || export PROTON_USE_XALIA=0
+[ "${WQ_PROTONFIXES:-0}" = 1 ] || export PROTONFIXES_DISABLE=1
+
+# A Windows game runs on Wine's display driver, whatever the desktop says. SDL_VIDEODRIVER=wayland in the
+# user's shell would make the game's own SDL3.dll look for a driver it doesn't have ("No displays available").
+unset SDL_VIDEODRIVER
+
+# What the game will see of the display. Printed into the launch log, so a "No displays available"
+# crash can be told apart: no socket (Xephyr not reachable), no monitors (RandR), or a wrong driver.
+echo "[display] DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-} XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-}"
+echo "[display] X sockets: $(ls /tmp/.X11-unix 2>&1 | tr '\n' ' ')"
+if command -v xrandr >/dev/null 2>&1; then
+  echo "[display] xrandr: $(timeout 5 xrandr --listmonitors 2>&1 | tr '\n' '|')"
+else
+  echo "[display] xrandr not installed (pacman -S xorg-xrandr to see monitors here)"
+fi
+# WQ_DEBUG_DISPLAY=1 ./wq   ->  Proton/Wine log in game/ (look for 'driver' and 'winex11' / 'display' lines)
+if [ "${WQ_DEBUG_DISPLAY:-0}" = 1 ]; then
+  export PROTON_LOG=1 PROTON_LOG_DIR="$PWD/.." WINEDEBUG="${WINEDEBUG:-+loaddll,err+all,fixme-all}"
+  echo "[display] Proton log will be written to $(cd "$PWD/.." && pwd)/steam-*.log"
+fi
+
+# Under the private X server (Xephyr) the game runs in a Wine virtual desktop the size of the Xephyr
+# screen: Xephyr gives Wine no usable monitor, and a Windows game's SDL3 then dies with
+# "SDL_Init failed: No displays available". profile.sh passes the Xephyr size as WQ_XEPHYR_SIZE.
+# WQ_WINE_DESKTOP=WxH picks another size, WQ_WINE_DESKTOP=0 turns it off.
+WQ_WINE_DESKTOP="${WQ_WINE_DESKTOP:-${WQ_XEPHYR_SIZE:-}}"
+if [[ "$WQ_WINE_DESKTOP" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]]; then
+  # The virtual desktop runs the prefix's explorer.exe. It has to be passed as a path: umu-run
+  # rejects the bare name "explorer" (that was a fixed bug, see test_umu_wrapper.sh). A prefix
+  # without explorer.exe (new or damaged) would fail the launch, so start the game without the
+  # desktop and say why.
+  EXPLORER_EXE="${WINEPREFIX:-}/drive_c/windows/system32/explorer.exe"
+  if [ -n "${WINEPREFIX:-}" ] && [ -f "$EXPLORER_EXE" ]; then
+    echo "[display] running inside a Wine virtual desktop ($WQ_WINE_DESKTOP)"
+    exec python3 "$LUTRIS_UMU" "$EXPLORER_EXE" "/desktop=wq,$WQ_WINE_DESKTOP" "$EXE_REL"
+  fi
+  echo "[display] explorer.exe not found in the prefix - starting without a virtual desktop"
+fi
+
 exec python3 "$LUTRIS_UMU" "$EXE_REL"
