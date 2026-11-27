@@ -20,9 +20,25 @@ case "$R" in
   "$H"|"$H"/*)
     bad "$R is inside your home folder. firejail --private hides it."
     DEST=/mnt/wine-quarantine
+    if [ -f "$DEST/install.sh" ] && [ -f "$DEST/_launch-core.sh" ] && [ -d "$DEST/wq-ui" ]; then
+      # Already installed: update that copy from this checkout instead of refusing.
+      ok "wine-quarantine is already installed at $DEST"
+      if ask "  Update it from this checkout (keeps your games, settings, Proton and rule downloads)?"; then
+        EXC=(--exclude=.git --exclude=./config.local.sh --exclude=./profile.defaults.conf --exclude=./_proton
+             --exclude=./_umu-data --exclude=./_umu-cache --exclude=./_yara-build --exclude=./_yara-feeds
+             --exclude=./_sandbox-test --exclude=./.sandbox-tests --exclude=./.wq-netfilter)
+        for g in "$R"/*/; do [ -f "${g}game.conf" ] && EXC+=("--exclude=./$(basename "$g")"); done   # never copy a game folder over
+        ( cd "$R" && tar --anchored "${EXC[@]}" -cf - . ) | ( cd "$DEST" && tar --no-same-owner -xf - ) \
+          || { bad "update failed"; exit 1; }
+        ok "updated $DEST"
+        exec "$DEST/install.sh"
+      fi
+      echo "    Run it from there instead:  $DEST/install.sh"
+      exit 0
+    fi
     if ask "  Move this checkout to $DEST now (needs sudo)?"; then
       if [ -e "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
-        bad "$DEST already exists and is not empty. Pick another place and re-run."; exit 1
+        bad "$DEST exists but is not a wine-quarantine install. Move or empty it, or pick another place."; exit 1
       fi
       sudo mkdir -p "$DEST" && sudo chown "$USER" "$DEST" && cp -a "$R/." "$DEST/" \
         || { bad "copy failed"; exit 1; }
@@ -210,12 +226,20 @@ else
   echo "  downloading (about 200MB, once, needs internet). umu prints its own progress:"
   echo
   PRIME_PFX="$(mktemp -d)"
-  XDG_DATA_HOME="$UMU_DATA" WINEPREFIX="$PRIME_PFX" PROTONPATH="$PROTON" GAMEID=umu-default python3 "$UMU" /bin/true
+  # a script or binary runs as itself; python3 is only for a zipapp / plain .py umu-run
+  if [ "$(head -c2 "$UMU" 2>/dev/null)" = "#!" ] || head -c4 "$UMU" 2>/dev/null | grep -q 'ELF'; then UMU_CMD=("$UMU"); else UMU_CMD=(python3 "$UMU"); fi
+  XDG_DATA_HOME="$UMU_DATA" WINEPREFIX="$PRIME_PFX" PROTONPATH="$PROTON" GAMEID=umu-default "${UMU_CMD[@]}" /bin/true
   rc=$?
   rm -rf "$PRIME_PFX"
   echo
   if [ "$rc" -eq 0 ] && RT="$(rt_dir)"; then ok "umu runtime ready ($(basename "$RT"))"
-  else bad "umu runtime setup failed (exit code $rc). Check your connection and Proton architecture, then run install.sh again."; fi
+  else
+    bad "umu runtime setup failed (exit code $rc). Check your connection and Proton architecture, then run install.sh again."
+    # A half-downloaded runtime folder would make the next run (and the launcher) think it is done.
+    if RT="$(rt_dir)" && ask "  Remove the possibly incomplete runtime ($(basename "$RT")) so the next run starts clean?"; then
+      rm -rf "$UMU_DATA/umu"/steamrt*
+    fi
+  fi
 fi
 
 # 5. integration + launcher

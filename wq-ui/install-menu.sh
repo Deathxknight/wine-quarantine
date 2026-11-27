@@ -21,7 +21,7 @@ SIZES="16 24 32 48 64 128 256 512"
 refresh_caches() {
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DATA/applications" 2>/dev/null
   command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t -f "$DATA/icons/hicolor" 2>/dev/null
-  command -v kbuildsycoca6 >/dev/null 2>&1 && kbuildsycoca6 >/dev/null 2>&1
+  command -v kbuildsycoca6 >/dev/null 2>&1 && kbuildsycoca6 --noincremental >/dev/null 2>&1
   return 0
 }
 
@@ -48,6 +48,12 @@ for s in $SIZES; do
   fi
 done
 
+# Point Icon= straight at the image file. A bare name ("wine-quarantine") goes through icon-theme lookup, which on
+# KDE (Papirus, Breeze, ...) can fall back to the generic "wine" glass because of the dash in the name.
+if   [ -f "$DATA/icons/hicolor/256x256/apps/$ID.png" ]; then ICON_REF="$DATA/icons/hicolor/256x256/apps/$ID.png"
+elif [ -f "$DATA/icons/hicolor/scalable/apps/$ID.svg" ]; then ICON_REF="$DATA/icons/hicolor/scalable/apps/$ID.svg"
+else ICON_REF="$ID"; fi
+
 cat > "$DATA/applications/$ID.desktop" <<DESK
 [Desktop Entry]
 Type=Application
@@ -55,7 +61,7 @@ Name=Wine Quarantine
 GenericName=Sandboxed Windows games
 Comment=Run Windows games in a firejail sandbox
 Exec="$QROOT/wq"
-Icon=$ID
+Icon=$ICON_REF
 Terminal=false
 Categories=Game;Utility;
 Keywords=wine;proton;sandbox;firejail;quarantine;

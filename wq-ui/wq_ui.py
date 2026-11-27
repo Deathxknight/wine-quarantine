@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -3052,7 +3053,31 @@ def find_qroot(settings: Settings) -> Path | None:
     return None
 
 
+def ensure_menu_entry() -> None:
+    """KDE/Wayland takes the taskbar icon from wine-quarantine.desktop. Without it the window's app id is used
+    as an icon NAME, 'wine-quarantine' is not in the theme, and the theme falls back to plain 'wine' (the glass).
+    So install the menu entry + icons when they are missing or point somewhere else. WQ_NO_MENU=1 turns this off."""
+    if os.environ.get("WQ_NO_MENU") == "1":
+        return
+    here = Path(__file__).resolve().parent
+    data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    desk = data / "applications" / f"{DESKTOP_ID}.desktop"
+    svg = data / "icons" / "hicolor" / "scalable" / "apps" / f"{DESKTOP_ID}.svg"
+    try:
+        if desk.is_file() and svg.is_file():
+            txt = desk.read_text()
+            if f'Exec="{here.parent}/wq"' in txt and "\nIcon=/" in txt:      # absolute Icon= path: see install-menu.sh
+                return
+        script = here / "install-menu.sh"
+        if script.is_file():
+            subprocess.Popen(["bash", str(script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+    except OSError:
+        pass
+
+
 def main() -> int:
+    ensure_menu_entry()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setDesktopFileName(DESKTOP_ID)           # Wayland picks the taskbar icon from wine-quarantine.desktop

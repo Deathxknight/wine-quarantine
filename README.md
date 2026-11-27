@@ -8,10 +8,10 @@ A Linux sandbox for Windows (Wine/Proton) and native programs, with a built-in a
 
 [Quick start](#quick-start) · [How a run works](#how-a-run-works) · [The app](#the-app) · [FAQ](#faq) · [Technical guide](docs/TECHNICAL.md)
 
-<figure align="center">
-  <img src="docs/screenshots/main_page.png" width="900" alt="The wine-quarantine window">
-  <figcaption><i>The wq-ui main window</i></figcaption>
-</figure>
+<img src="docs/screenshots/main_page.png" width="900" alt="The wine-quarantine window"><br>
+<sub><i>The wq-ui main window</i></sub>
+
+</div>
 
 ---
 
@@ -165,7 +165,7 @@ Everything stays in the game's own folder, `/mnt/wine-quarantine/<Game>/`: Windo
 Select it and press **Remove**. It moves to your Trash.
 
 **How do I update?**
-`git pull`, then `./install.sh`. For games made by an older version, `./update-launchers.sh --apply` brings their launchers up to date.
+`git pull`, then `./install.sh`. If your checkout is in your home folder and wine-quarantine is already at `/mnt/wine-quarantine`, `install.sh` offers to update that copy in place (your games, settings, Proton and rule downloads are kept). For games made by an older version, `./update-launchers.sh --apply` brings their launchers up to date.
 
 **Why not just use a virtual machine?**
 A VM isolates more strongly. This is lighter, starts instantly, gives games your real GPU, and comes with the scanning and monitoring built in. See the next section for when to use both.
@@ -208,9 +208,6 @@ wine-quarantine stands on the shoulders of [firejail](https://github.com/netblue
 | [capa-rules](https://github.com/mandiant/capa-rules) | Apache-2.0 |
 | [YARAhub](https://yaraify.abuse.ch/yarahub/) (abuse.ch), downloaded on demand | per rule |
 
-
-wine-quarantine` is licensed under the **GNU General Public License v2.0** — see [LICENSE](LICENSE) for details. Bundled third-party rule sets under `third_party/` keep their original licenses (see [third_party/README.md](third_party/README.md)).
-
 ## License
 
-`wine-quarantine` is licensed under the **GNU General Public License v2.0** — see [LICENSE](LICENSE) for details.
+`wine-quarantine` is licensed under the **GNU General Public License v2.0**, see [LICENSE](LICENSE). Bundled third-party rule sets under `third_party/` keep their original licenses (see [third_party/README.md](third_party/README.md)).
