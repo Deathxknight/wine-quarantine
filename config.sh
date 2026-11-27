@@ -1,7 +1,6 @@
 #!/bin/bash
-# Paths are autodetected where possible. To override anything, create
-# config.local.sh next to this file (it is gitignored) or export the
-# variable before running.
+# Paths are autodetected where possible. To override something, put it in config.local.sh
+# next to this file (gitignored) or export the variable first.
 
 QROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -37,9 +36,8 @@ PROTON_PREFERRED="${PROTON_PREFERRED:-}"
 
 REQUIRED_BINS=(firejail inotifywait python3)
 
-# --- ClamAV scanning (wq-scan.sh) -------------------------------------------
-# Scans game/ + prefix/ (or home/ for native games) when a game is added and
-# after every run. Override any of these in config.local.sh.
+# ClamAV (wq-scan.sh): scans game/ plus prefix/ (home/ for native games) when a game is added
+# and after every run. Override any of these in config.local.sh.
 : "${CLAM_SCAN_ON_ADD:=1}"        # scan game/ right after Add
 : "${CLAM_SCAN_AFTER_RUN:=1}"     # scan what the run changed (per game: CLAM_SCAN=0|1 in game.conf)
 : "${CLAM_FULL_EVERY_DAYS:=7}"    # after-run scans only look at changed files; do a full one this often
@@ -50,6 +48,24 @@ REQUIRED_BINS=(firejail inotifywait python3)
 : "${CLAM_DB_DIR:=}"              # empty = autodetect (/var/lib/clamav ...)
 : "${CLAM_BIN:=}"                 # empty = clamscan (or clamdscan) from PATH; set a full path to override
 : "${CLAM_EXCLUDE_REGEX:=}"       # extended regex, matching paths are not scanned
+
+# YARA (wq-yara.sh): runs with the rule sets bundled under third_party/ before each launch and after
+# each run. The ruleset is built on first use into _yara-build/. Override in config.local.sh.
+: "${YARA_RULES:=$QROOT/_yara-build}"  # a folder from wq-yara-build.sh, or one rule file
+: "${YARA_LEVEL:=AUTO}"                # AUTO = by severity: high-risk rule refuses the launch, medium warns, informational is quiet. WARN = log every match, ALERT = any match refuses the launch
+: "${YARA_BLOCK_SCORE:=70}"             # AUTO: rules scored at least this are high-risk (signature-base scores run 40-85)
+: "${YARA_WARN_SCORE:=40}"               # AUTO: rules scored at least this (and below the block score) are warnings
+: "${PRESCAN_SYS32_POINTS:=5}"        # points an unlisted system32 change adds to the game's score when MONITOR_SYS32_SCORE=1 (5 = the launch limit, so one is enough to refuse the next launch)
+: "${YARA_FEEDS_UPDATE:=1}"           # fetch the public YARAhub rules (abuse.ch) before scans, at most every YARAHUB_MIN_HOURS; 0 = never touch the network
+: "${YARAHUB_MIN_HOURS:=24}"
+: "${YARA_AUTOBUILD:=1}"               # build the bundled rules when missing or out of date (needs yarac)
+: "${YARA_FULL_EVERY_DAYS:=7}"         # incremental scans look at changed files; do a full one this often
+: "${YARA_MAX_FILESIZE_MB:=200}"       # larger files are skipped
+: "${YARA_TIMEOUT:=300}"               # seconds before a scan is cut off
+: "${YARA_SANDBOX:=1}"                 # run yara inside a no-network firejail
+: "${YARA_EXCLUDE_REGEX=/prefix/(system|user|userdef)\.reg(\.old)?$}"   # extended regex, matching paths are not scanned. Default skips Wine's text registry files (PE rules such as Surtr hit them; reg-diff.sh covers the registry). Set to "" in config.local.sh to scan them
+# capa (behaviour rules from third_party/capa-rules) is run by wq-prescan.py when the capa program is
+# installed; see PRESCAN_CAPA* in wq-prescan.py. Per game: CAPA_SCAN=0|1 in game.conf.
 ALERT_TERMINAL="${ALERT_TERMINAL:-}"
 
 POLL_INTERVAL="${POLL_INTERVAL:-2}"   # a process is only inspected once seen on two polls, so this is the shortest life it can be caught in x2
@@ -59,11 +75,49 @@ NATIVE_VERIFY="${NATIVE_VERIFY:-1}"
 LOG_FLUSH_INTERVAL="${LOG_FLUSH_INTERVAL:-2}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 
+# The game inherits the launcher's environment, so a token or cloud key exported in your shell
+# would be readable by it (and sent out if it has network). Variables whose NAME looks like a secret
+# are removed before the sandbox starts. Extended regex, case-insensitive, matched against each
+# exported name. Set WQ_ENV_SCRUB_RE="" in config.local.sh to turn it off. PULSE_COOKIE and
+# XAUTHORITY are left alone on purpose, audio and X11 need them.
+: "${WQ_ENV_SCRUB_RE=(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|AUTH_?KEY|SESSION_?KEY)(_|$)|^(AWS|AZURE|GH|GITHUB|GITLAB|NPM|DOCKER|CLOUDFLARE|ANTHROPIC|OPENAI|HF|HUGGINGFACE|SLACK|STRIPE|TWILIO|SENTRY|VAULT|KUBE|GOOGLE_APPLICATION)_|^(SSH_AGENT_PID|GPG_AGENT_INFO|GNOME_KEYRING_CONTROL)$}"
+
+# Session identifiers from the host desktop/service manager (Hyprland, UWSM, systemd user manager).
+# Not secrets, but HYPRLAND_INSTANCE_SIGNATURE is the handle to the compositor's IPC socket, and the
+# rest fingerprint the session. Removed the same way. XDG_* is deliberately not listed: the sandbox
+# needs XDG_RUNTIME_DIR, and XDG_SESSION_TYPE is forced to x11 by firejail itself. Set
+# WQ_ENV_SESSION_RE="" in config.local.sh to keep them.
+: "${WQ_ENV_SESSION_RE=^(HYPRLAND_|UWSM_|MANAGERPID$|MANAGERPIDFDID$|SYSTEMD_EXEC_PID$|INVOCATION_ID$|MEMORY_PRESSURE_|JOURNAL_STREAM$)}"
+
+# wq_clean_text / wq_clean_stream live in lib-clean.sh so that scripts which must not load all of config.sh can use them
+# shellcheck source=lib-clean.sh
+. "$QROOT/lib-clean.sh"
+
+# wq_scrub_env_args: fills WQ_ENV_SCRUB with "-u NAME" pairs for `env`, one per matching variable
+wq_scrub_env_args() {
+  WQ_ENV_SCRUB=()
+  local n
+  while IFS= read -r n; do
+    [[ "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [ -n "${WQ_ENV_SCRUB_RE:-}" ] && [[ "${n^^}" =~ $WQ_ENV_SCRUB_RE ]]; then
+      WQ_ENV_SCRUB+=(-u "$n")
+    elif [ -n "${WQ_ENV_SESSION_RE:-}" ] && [[ "${n^^}" =~ $WQ_ENV_SESSION_RE ]]; then
+      WQ_ENV_SCRUB+=(-u "$n")
+    fi
+  done < <(compgen -e)
+  return 0
+}
+
 # HOME_BLACKLIST is relative to $HOME, BLACKLIST_PATHS takes absolute paths
 declare -p HOME_BLACKLIST >/dev/null 2>&1 || HOME_BLACKLIST=()
 declare -p BLACKLIST_PATHS >/dev/null 2>&1 || BLACKLIST_PATHS=()
 
-: "${SECCOMP_DROP:=add_key,request_key,keyctl,init_module,finit_module,delete_module,kexec_load,kexec_file_load,reboot,swapon,swapoff,acct,quotactl,open_by_handle_at,perf_event_open,userfaultfd,io_uring_setup,io_uring_enter,io_uring_register,bpf}"
+# --seccomp.drop=LIST blocks exactly LIST: it does NOT add firejail's default blacklist (--seccomp does). The tail of
+# this list (syslog ... kcmp) is the part of that default list that no game needs and that is safe for Wine/Proton:
+# kernel log reads (a KASLR leak), legacy port I/O, clock stepping, fanotify and cross-process fd comparison.
+# mount/umount2/ptrace/process_vm_* are left to the per-game profile on purpose: Proton's container needs mount,
+# and some Wine programs read other processes' memory.
+: "${SECCOMP_DROP:=add_key,request_key,keyctl,init_module,finit_module,delete_module,kexec_load,kexec_file_load,reboot,swapon,swapoff,acct,quotactl,open_by_handle_at,perf_event_open,userfaultfd,io_uring_setup,io_uring_enter,io_uring_register,bpf,syslog,sysfs,iopl,ioperm,adjtimex,clock_adjtime,fanotify_init,kcmp}"
 
 declare -p QUARANTINE_FIREJAIL_ARGS >/dev/null 2>&1 || QUARANTINE_FIREJAIL_ARGS=(
   --noprofile
@@ -110,6 +164,13 @@ check_deps() {
     missing+=("$LUTRIS_UMU  (umu-run, not executable)")
   fi
   [ -d "$QROOT" ] || missing+=("$QROOT  (quarantine root, not a directory)")
+  # firejail is a setuid-root program, so the sandbox is only as trustworthy as that binary. Before 0.9.70 an
+  # unprivileged user could become root through --join (CVE-2022-31214). An unreadable version is not an error.
+  local fjv
+  fjv="$(firejail --version 2>/dev/null | sed -n '1s/.*[^0-9.]\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+  if [ -n "$fjv" ] && [ "$(printf '%s\n%s\n' "$fjv" 0.9.70 | sort -V | head -n1)" != "0.9.70" ]; then
+    missing+=("firejail $fjv is older than 0.9.70: it runs setuid root and those versions have a local root hole (CVE-2022-31214). Update it")
+  fi
   local pp ph
   pp="$(find_proton "" 2>/dev/null || true)"
   if [ -z "$pp" ]; then
@@ -168,6 +229,44 @@ detect_terminal() {
   return 1
 }
 
+# The Proton version a build would stamp into a prefix: the last word of its `version` file
+# ("1760000000 UMU-Proton-10.0-4"), else the folder name.
+proton_build_version() {
+  local d="$1" v=""
+  [ -f "$d/version" ] && v="$(head -n1 "$d/version" 2>/dev/null | awk '{print $NF}' | tr -d '\r')"
+  [ -n "$v" ] || v="$(basename "$d")"
+  printf '%s' "$v"
+}
+
+# The Proton version that last touched a prefix (its `version` file); empty if unknown.
+prefix_proton_version() {
+  local pfx="$1" f
+  for f in "$pfx/version" "$pfx/pfx/version"; do
+    [ -f "$f" ] && { head -n1 "$f" 2>/dev/null | awk '{print $NF}' | tr -d '\r'; return 0; }
+  done
+  return 1
+}
+
+# The installed Proton build that matches the version a prefix was made with, if there is one.
+# Proton rewrites every builtin DLL in the prefix when the version changes (and refuses to go
+# backwards), so staying on the prefix's own build avoids that completely.
+find_proton_for_prefix() {
+  local want d c
+  want="$(prefix_proton_version "$1/prefix" 2>/dev/null || true)"
+  [ -n "$want" ] || return 1
+  for d in "${PROTON_SEARCH_DIRS[@]}"; do
+    [ -d "$d" ] || continue
+    for c in "$d"/*/toolmanifest.vdf; do
+      [ -f "$c" ] || continue
+      c="$(dirname "$c")"
+      if [ "$(basename "$c")" = "$want" ] || [ "$(proton_build_version "$c")" = "$want" ]; then
+        readlink -f "$c"; return 0
+      fi
+    done
+  done
+  return 1
+}
+
 find_proton() {
   local gamedir="${1:-}"
   if [ -n "$gamedir" ] && [ -f "$gamedir/proton.path" ]; then
@@ -178,6 +277,11 @@ find_proton() {
   fi
   if [ -n "$PROTON_PREFERRED" ] && [ -f "$PROTON_PREFERRED/toolmanifest.vdf" ]; then
     readlink -f "$PROTON_PREFERRED"; return 0
+  fi
+  # no explicit choice: stay on the build the prefix was created with
+  if [ -n "$gamedir" ]; then
+    local m; m="$(find_proton_for_prefix "$gamedir" 2>/dev/null || true)"
+    [ -n "$m" ] && { echo "$m"; return 0; }
   fi
   # newest build in the first search dir that has any (version sort: 10-9 < 10-10)
   local d cand
@@ -219,6 +323,22 @@ valid_exe_rel() {
     ""|/*|..|../*|*/..|*/../*|*$'\n'*|*$'\r'*) return 1 ;;
   esac
   return 0
+}
+
+# EXE= is relative to game/ unless it starts with @prefix/, which means "inside the Wine prefix"
+# (where an installer puts what it installs). wq_exe_root prints the folder, wq_exe_rel the path in it.
+# wq-ui/wq_core.py has the same two rules (exe_root).
+wq_exe_root() {
+  case "$2" in
+    @prefix/*) printf '%s/prefix' "$1" ;;
+    *)         printf '%s/game' "$1" ;;
+  esac
+}
+wq_exe_rel() {
+  case "$1" in
+    @prefix/*) printf '%s' "${1#@prefix/}" ;;
+    *)         printf '%s' "$1" ;;
+  esac
 }
 
 build_blacklist_args() {
@@ -296,9 +416,9 @@ term_run() {
   esac
 }
 
-# The per-game launch-quarantine.sh is a thin wrapper that resolves everything from its own
-# location, so a launcher fix never needs a per-game rewrite. One definition, used by
-# new-quarantine.sh, wq-ui/new-native.sh and update-launchers.sh.
+# Each game's launch-quarantine.sh is a thin wrapper that works everything out from its own
+# location, so fixing the launcher never means rewriting per-game files. Defined once here and
+# used by new-quarantine.sh, wq-ui/new-native.sh and update-launchers.sh.
 wq_launcher_text() {   # wq_launcher_text <windows|native>
   local core='_launch-core.sh'
   [ "${1:-}" = native ] && core='wq-ui/_launch-native.sh'
@@ -312,3 +432,17 @@ if [ -f "$QROOT/wq-ui/profile.sh" ]; then
     # shellcheck source=/dev/null
     . "$QROOT/wq-ui/profile.sh"
 fi
+
+# wq_post_scan <script> <args...>: run a post-run scan (wq-scan.sh, wq-yara.sh). Exit 0 (clean) and 1 (findings,
+# already logged by the script) are normal. Anything else (not executable, missing, crashed) means the scan
+# never produced a result: say so in the alert log, so the run summary cannot read CLEAN with a scan missing.
+wq_post_scan() {
+  local script="$1" rc=0 msg; shift
+  "$QROOT/$script" "$@" || rc=$?
+  case "$rc" in 0|1) return 0 ;; esac
+  msg="$script did not complete (exit $rc): no result from it for this run. Check it exists and is executable (chmod +x $QROOT/$script)"
+  msg="$(wq_clean_text "$msg")"
+  printf 'wq: %s\n' "$msg" >&2
+  [ -n "${ALERTLOG:-}" ] && printf '[%s] [WARN] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >> "$ALERTLOG"
+  return 0
+}

@@ -80,4 +80,15 @@ run "$T/a4.reg"; eqn "Winlogon key removed is an alert" 1 "$(count 'key removed'
 { cat "$T/before.reg"; printf '\n[Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run] 1700000000\n#time=1\n'; for i in 1 2 3 4 5 6 7 8; do printf '"E%s"="C:\\\\e%s.exe"\n' $i $i; done; } > "$T/a5.reg"
 run "$T/a5.reg"; eqn "hits are capped at 5 alerts" 5 "$(count ALERT)"; grep -q '3 more persistence' "$T/alerts" && ok || fail "pointer to the rest"
 
+# a hive that is a symlink (to a host file, /dev/zero, ...) is an alert and is never copied
+rm -rf "$G/.reg-snapshot" "$G"/logs/*; : > "$T/alerts"; cp "$T/before.reg" "$G/prefix/system.reg"
+"$SRC/reg-diff.sh" snapshot "$G"
+echo "host secret" > "$T/secret.txt"; rm -f "$G/prefix/user.reg"; ln -s "$T/secret.txt" "$G/prefix/user.reg"
+"$SRC/reg-diff.sh" snapshot "$G"
+[ ! -e "$G/.reg-snapshot/user.reg.before" ] && ok || fail "symlinked hive was copied into the snapshot"
+"$SRC/reg-diff.sh" compare "$G" "$T/alerts" >/dev/null
+grep -q 'ALERT.*user.reg is a symlink' "$T/alerts" && ok || fail "symlinked hive raised no alert" "$(cat "$T/alerts")"
+grep -q 'host secret' "$G"/logs/* 2>/dev/null && fail "contents of the link target leaked into a log" || ok
+rm -f "$G/prefix/user.reg"
+
 echo; echo "$PASS passed, $FAIL failed"; [ "$FAIL" -eq 0 ]

@@ -5,15 +5,15 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULTS_NAME = "profile.defaults.conf"
 
-# --------------------------------------------------------------------------
 # options
-# --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -26,29 +26,156 @@ class BoolOpt:
 
 
 BOOL_OPTS: list[BoolOpt] = [
-    BoolOpt("FJ_PRIVATE_HOME", "Hide home directory", True, "--private: $HOME is an empty tmpfs. Only whitelisted paths show up inside.", "isolation"),
-    BoolOpt("FJ_PRIVATE_TMP", "Private /tmp", True, "--private-tmp", "isolation"),
-    BoolOpt("FJ_NONEWPRIVS", "No new privileges", True, "--nonewprivs", "isolation"),
-    BoolOpt("FJ_CAPS_DROP", "Drop all capabilities", True, "--caps.drop=all", "isolation"),
-    BoolOpt("FJ_NODBUS", "Block D-Bus", True, "--nodbus", "isolation"),
-    BoolOpt("FJ_SECCOMP", "Seccomp syscall filter", True, "--seccomp.drop=... (list lives in config.sh: SECCOMP_DROP)", "isolation"),
-    BoolOpt("FJ_NOROOT", "No root user namespace", False, "--noroot: user namespace with only the current user mapped.", "isolation"),
-    BoolOpt("FJ_MACHINE_ID", "Spoof machine-id", True, "--machine-id: the game sees a random /etc/machine-id instead of the stable ID of this PC.", "isolation"),
-    BoolOpt("FJ_NOSOUND", "Block audio", False, "--nosound", "devices"),
-    BoolOpt("FJ_NOVIDEO", "Block webcams", False, "--novideo", "devices"),
-    BoolOpt("FJ_NOU2F", "Block U2F / security keys", False, "--nou2f", "devices"),
-    BoolOpt("FJ_NOTV", "Block TV / DVB devices", False, "--notv", "devices"),
-    BoolOpt("FJ_NODVD", "Block optical drives", False, "--nodvd", "devices"),
+    BoolOpt("FJ_PRIVATE_HOME", "Hide home directory", True, "$HOME is an empty tmpfs; only whitelisted paths show up (--private).", "isolation"),
+    BoolOpt("FJ_PRIVATE_TMP", "Private /tmp", True, "Own empty /tmp (--private-tmp)", "isolation"),
+    BoolOpt("FJ_NONEWPRIVS", "No new privileges", True, "No privilege gain via setuid etc. (--nonewprivs)", "isolation"),
+    BoolOpt("FJ_CAPS_DROP", "Drop all capabilities", True, "Drops all Linux capabilities (--caps.drop=all)", "isolation"),
+    BoolOpt("FJ_NODBUS", "Block D-Bus", True, "No D-Bus access (--nodbus)", "isolation"),
+    BoolOpt("FJ_SECCOMP", "Seccomp syscall filter", True, "Blocks risky syscalls. The list is SECCOMP_DROP in config.sh.", "isolation"),
+    BoolOpt("FJ_NOROOT", "No root user namespace", False, "User namespace with only your user mapped (--noroot).", "isolation"),
+    BoolOpt("FJ_MACHINE_ID", "Spoof machine-id", True, "Random /etc/machine-id instead of this PC's (--machine-id).", "isolation"),
+    BoolOpt("FJ_NOGROUPS", "Drop supplementary groups", True,
+            "Game runs without docker/input/libvirt/wheel... group membership (--nogroups). "
+            "Firejail ignores this on NVIDIA systems.", "isolation"),
+    BoolOpt("FJ_PRIVATE_DEV", "Minimal /dev", True,
+            "Only a small set of device nodes instead of the host's /dev (--private-dev).", "isolation"),
+    BoolOpt("FJ_NOINPUT", "Hide raw input devices", True,
+            "Hides /dev/input/*, so a game can't read keystrokes system-wide (--noinput). "
+            "Turn off for gamepads/joysticks that need evdev.", "isolation"),
+    BoolOpt("FJ_BLOCK_SOCKETS", "Hide host control sockets", True,
+            "Hides docker/podman/libvirt/containerd/systemd, gpg/ssh-agent and resolver sockets. "
+            "Resolver sockets stay visible in unrestricted network mode.", "isolation"),
+    BoolOpt("FJ_RESTRICT_NS", "Restrict namespaces", False,
+            "Blocks creating new namespaces (--restrict-namespaces). On by default for native games, "
+            "off for Wine/Proton games (pressure-vessel and some launchers need namespaces).", "isolation"),
+    BoolOpt("FJ_IPC_NS", "Private IPC namespace", True,
+            "Own SysV shared memory, semaphores and message queues, so the game can't see the host's (--ipc-namespace). "
+            "Turn off only if a game draws nothing under the private X server.", "isolation"),
+    BoolOpt("FJ_PROTOCOL", "Only normal socket types", True,
+            "Allows unix, inet, inet6 and netlink sockets only (--protocol). Raw packet, vsock, bluetooth, AF_ALG and "
+            "other unusual families, where kernel exploits have come in, are refused.", "isolation"),
+    BoolOpt("FJ_MEMFD", "Block memfd_create (fileless exec)", False,
+            "Blocks memfd_create with seccomp, so a program can't build an executable in anonymous memory and run it "
+            "without touching disk. Many Wine/Proton games, Mesa, SDL and Wayland clients use memfd_create, so turn it "
+            "on for native games or one game at a time. Needs the seccomp filter on.", "isolation"),
+    BoolOpt("FJ_MDWX", "Deny write+execute memory", False,
+            "Memory can't be writable and executable at once, and a program can't add execute to memory it wrote "
+            "(--memory-deny-write-execute). Stops in-process shellcode and loaders. Wine/Proton, DXVK and every JIT "
+            "(Mono, Java, JavaScript engines) need that, so turn it on for native games without a JIT.", "isolation"),
+    BoolOpt("FJ_BLOCK_MEDIA", "Hide other drives", True,
+            "Hides /media, /run/media and /mnt (USB sticks and other mounted disks). "
+            "Skipped for any of them that contains the game, umu data or a whitelisted path.", "isolation"),
+    BoolOpt("FJ_GAME_RO", "Read-only game folder", False,
+            "Mounts game/ read-only so a game can't patch its own files or leave payloads between runs. "
+            "Wine saves go to the prefix, but native games that save inside game/ will fail to save.", "isolation"),
+    BoolOpt("FJ_NOSOUND", "Block audio", False, "No audio devices (--nosound)", "devices"),
+    BoolOpt("FJ_NOVIDEO", "Block webcams", False, "No webcams (--novideo)", "devices"),
+    BoolOpt("FJ_NOU2F", "Block U2F / security keys", False, "No security keys (--nou2f)", "devices"),
+    BoolOpt("FJ_NOTV", "Block TV / DVB devices", False, "No TV/DVB devices (--notv)", "devices"),
+    BoolOpt("FJ_NODVD", "Block optical drives", False, "No optical drives (--nodvd)", "devices"),
+    BoolOpt("PRESCAN", "Pre-launch scan", True,
+            "Before the sandbox starts: ClamAV, out-of-date signature check and static checks for packed or "
+            "disguised programs. A bad result refuses the launch (PRESCAN=0 turns it off).",
+            "monitoring"),
     BoolOpt("CLAM_SCAN", "ClamAV scan after each run", True,
-            "Scan what the run changed with clamscan. Off = no scan after runs (CLAM_SCAN=0). "
-            "Wine games: the files from the first-run bootstrap are skipped, only what the game adds is scanned.",
+            "Scans what the run changed with clamscan (CLAM_SCAN=0 turns it off). "
+            "Wine games: first-run bootstrap files are skipped.",
+            "monitoring"),
+    BoolOpt("YARA_SCAN", "YARA scan", True,
+            "Matches the game's files against the bundled YARA rules (signature-base, Yara-Rules) before launch "
+            "and again for what a run changed. Needs the yara package: ticked without it, the launch is refused. "
+            "The ruleset builds itself on first use (YARA_SCAN=0 turns it off). High-risk rule matches refuse the launch, medium ones are warnings, informational ones (packer/file-type rules) are one quiet line (YARA_LEVEL=AUTO; WARN or ALERT treat every match alike).",
+            "monitoring"),
+    BoolOpt("CAPA_SCAN", "capa behaviour scan", True,
+            "Before launch, runs capa with the bundled capa-rules on the game's executables and flags startup "
+            "persistence and keylogging behaviour. Needs the capa program: ticked without it, the launch is refused "
+            "(CAPA_SCAN=0 turns it off).",
             "monitoring"),
     BoolOpt("MONITOR_KILL", "Alerts stop the sandbox", True,
-            "On: the first ALERT kills the sandbox (kill switch). Off: alerts are still logged and "
-            "show in the summary, but the game keeps running (MONITOR_KILL=0).",
+            "On: the first ALERT kills the sandbox. Off: alerts are logged but the game keeps "
+            "running (MONITOR_KILL=0).",
+            "monitoring"),
+    BoolOpt("MONITOR_SYS32_SCORE", "Score system32 changes instead of stopping", False,
+            "On: a system32 change that is not Proton's own file adds PRESCAN_SYS32_POINTS (5, the launch "
+            "limit) to the game's score and the game keeps running. The next launch is refused until the "
+            "log is reviewed and logs/.run-score deleted. Proton's own files are never counted.",
             "monitoring"),
 ]
 BOOL_BY_KEY = {o.key: o for o in BOOL_OPTS}
+
+# --- presets and UI grouping --------------------------------------------------
+# Rarely changed isolation options, shown under "Advanced" in the Protection tab.
+ADVANCED_KEYS = ("FJ_MACHINE_ID", "FJ_RESTRICT_NS", "FJ_NOROOT", "FJ_PRIVATE_DEV", "FJ_NOINPUT",
+                 "FJ_BLOCK_SOCKETS", "FJ_NOGROUPS", "FJ_IPC_NS", "FJ_PROTOCOL", "FJ_MEMFD", "FJ_MDWX")
+# On in every preset: turning these off is possible, but it is never part of a preset.
+PRESET_FLOOR = ("FJ_PRIVATE_HOME", "FJ_PRIVATE_TMP", "FJ_NONEWPRIVS", "FJ_CAPS_DROP", "FJ_NODBUS", "FJ_SECCOMP",
+                "FJ_MACHINE_ID", "FJ_BLOCK_SOCKETS", "FJ_NOGROUPS", "FJ_PRIVATE_DEV", "FJ_BLOCK_MEDIA",
+                "FJ_IPC_NS", "FJ_PROTOCOL",
+                "CLAM_SCAN", "YARA_SCAN", "CAPA_SCAN", "MONITOR_KILL", "PRESCAN")
+_STRICT = {o.key: True for o in BOOL_OPTS}
+_STRICT.update({"FJ_NET": False, "FJ_NET_OPEN": False, "FJ_NET_LEARN": False})
+_BALANCED = {**_STRICT, "FJ_GAME_RO": False, "FJ_RESTRICT_NS": False, "FJ_NOSOUND": False, "FJ_MEMFD": False, "FJ_MDWX": False}
+_COMPAT = {**_BALANCED, "FJ_NOINPUT": False, "FJ_NOROOT": False, "FJ_NET": True}
+PRESETS: dict[str, dict[str, bool]] = {"Strict": _STRICT, "Balanced": _BALANCED, "Compatibility": _COMPAT}
+PRESET_NOTES = {
+    "Strict": "Everything on, no network. Wine and Proton games usually need Balanced.",
+    "Balanced": "Read-only game folder, audio blocking, namespace restriction, memfd blocking and write+execute denial are off. Works for most games.",
+    "Compatibility": "Balanced, plus gamepads and a filtered network connection (pick an interface in Network).",
+}
+
+
+def preset_match(states: dict[str, bool | None]) -> str:
+    """Name of the preset the given box states equal, else \"Custom\". None = games differ."""
+    for name, want in PRESETS.items():
+        if all(states.get(k) is v for k, v in want.items()):
+            return name
+    return "Custom"
+
+
+def is_relaxed(key: str, state: bool | None) -> bool:
+    """True when a setting is weaker than Strict. Games that disagree (None) count as relaxed."""
+    want = PRESETS["Strict"].get(key)
+    return want is not None and (state is None or state != want)
+
+
+PLAIN = {
+    "FJ_PRIVATE_HOME": "The game sees an empty private home folder instead of yours.",
+    "FJ_PRIVATE_TMP": "The game gets its own empty /tmp, so it can't read other programs' temp files.",
+    "FJ_NONEWPRIVS": "Stops the game from gaining extra privileges, for example through setuid programs.",
+    "FJ_CAPS_DROP": "Removes all special Linux powers from the game's processes.",
+    "FJ_NODBUS": "Blocks access to the desktop message bus, which controls many system services.",
+    "FJ_SECCOMP": "Blocks a list of risky system calls (the list is SECCOMP_DROP in config.sh).",
+    "FJ_NOROOT": "The game runs in a user namespace where only your user exists.",
+    "FJ_MACHINE_ID": "The game sees a random machine ID, so it can't recognise this PC.",
+    "FJ_NOGROUPS": "The game doesn't inherit your group memberships (docker, input, wheel and so on).",
+    "FJ_PRIVATE_DEV": "The game sees a short list of device files instead of everything in /dev.",
+    "FJ_NOINPUT": "Hides raw keyboard and mouse devices so the game can't log keystrokes system-wide. Gamepads may need this off.",
+    "FJ_BLOCK_SOCKETS": "Hides the sockets used to control docker, libvirt, gpg-agent, ssh-agent and similar.",
+    "FJ_RESTRICT_NS": "Stops the game from creating new namespaces. Wine and Proton launchers often need this off.",
+    "FJ_BLOCK_MEDIA": "Hides USB sticks and other mounted drives.",
+    "FJ_IPC_NS": "The game gets its own shared-memory and message-queue space, so it can't reach the host's.",
+    "FJ_MEMFD": "The game can't create anonymous in-memory files, which is how payloads run without touching disk. Many Wine and Proton games need this off.",
+    "FJ_MDWX": "Memory can't be both writable and executable, so a program can't write code into memory and run it. Wine, Proton and anything with a JIT need this off.",
+    "FJ_PROTOCOL": "The game can only open ordinary sockets (unix, internet, netlink), not the unusual kinds exploits have used.",
+    "FJ_GAME_RO": "The game folder can't be changed, so a game can't patch itself. Games that save inside it will fail to save.",
+    "FJ_NOSOUND": "No sound in the game.",
+    "FJ_NOVIDEO": "The game can't use webcams.",
+    "FJ_NOU2F": "The game can't talk to security keys.",
+    "FJ_NOTV": "The game can't use TV tuner devices.",
+    "FJ_NODVD": "The game can't use optical drives.",
+    "PRESCAN": "Checks the game's files before it starts and refuses to launch it if they look like malware.",
+    "CLAM_SCAN": "Scans the files the game changed with ClamAV after each run.",
+    "YARA_SCAN": "Checks the game's files against the bundled YARA rules before it starts and after each run.",
+    "CAPA_SCAN": "Runs capa on the game's programs before it starts and flags persistence and keylogging behaviour.",
+    "MONITOR_KILL": "Stops the game as soon as the monitor raises an alert.",
+    "MONITOR_SYS32_SCORE": "Unlisted system32 changes add points to the game's score instead of stopping the game.",
+    "FJ_NET": "Gives the game a network connection behind a default-deny filter.",
+    "FJ_NET_OPEN": "Removes all network filtering. The game can reach anything you can.",
+    "FJ_NET_DNS": "Lets the game look up host names.",
+    "FJ_NET_LOG": "Records the game's connection attempts so you can review them.",
+    "FJ_NET_LEARN": "Allows every connection and logs it, to build a whitelist from.",
+    "FJ_XEPHYR": "Runs the game in its own X server window so it can't see your screen or keystrokes.",
+}
 
 NET_BOOLS: dict[str, bool] = {
     "FJ_NET": False,        # network enabled at all
@@ -73,9 +200,7 @@ LIST_KEYS = ("FJ_NET_ALLOW", "FJ_WL_RW", "FJ_WL_RO", "FJ_DEV_BLOCK", "FJ_HOOK_PR
 # part of the profile, unlike the whitelists / hooks, which are kept)
 MANAGED_SCALARS = tuple(ALL_BOOLS) + tuple(TEXT_KEYS) + (EXTRA_ARGS_KEY,)
 
-# --------------------------------------------------------------------------
 # KEY=value files (read as data, same as read_game_conf in config.sh)
-# --------------------------------------------------------------------------
 
 
 def parse_kv(path: Path) -> dict[str, list[str]]:
@@ -146,9 +271,7 @@ def write_kv(path: Path, updates: dict[str, list[str] | str | None]) -> None:
         raise
 
 
-# --------------------------------------------------------------------------
 # games
-# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -182,7 +305,10 @@ class Game:
         return builtin
 
     def flag(self, key: str, defaults: dict[str, list[str]]) -> bool:
-        return self.scalar(key, defaults, "1" if ALL_BOOLS[key] else "0") == "1"
+        builtin = ALL_BOOLS[key]
+        if key == "FJ_RESTRICT_NS" and self.runner == "native":
+            builtin = True                 # same runner-dependent default as profile.sh
+        return self.scalar(key, defaults, "1" if builtin else "0") == "1"
 
     def effective_lines(self, key: str, defaults: dict[str, list[str]]) -> list[str]:
         """Non-blank values of a list key. If game.conf has the key at all (even as an
@@ -214,9 +340,7 @@ def scan_games(qroot: Path) -> list[Game]:
     return games
 
 
-# --------------------------------------------------------------------------
 # paths
-# --------------------------------------------------------------------------
 
 # firejail --whitelist only works under $HOME and these top-level dirs
 WHITELIST_TOPS = {"/dev", "/media", "/mnt", "/opt", "/srv", "/sys", "/tmp", "/var"}
@@ -231,15 +355,15 @@ def classify_path(p: str | Path, home: str | Path | None = None) -> tuple[str, s
     if not path.exists():
         return "missing", "Path does not exist"
     if real == home or real.startswith(home + os.sep):
-        return "home", ("Inside $HOME. firejail --private hides everything in home except what is "
-                        "whitelisted, so this is blocked unless it is whitelisted.")
+        return "home", ("Inside $HOME. --private hides all of home except whitelisted paths, so this is "
+                        "blocked unless you whitelist it.")
     top = "/" + real.split("/")[1] if real.count("/") >= 1 and real != "/" else "/"
     if top in WHITELIST_TOPS:
         return "ok", f"Under {top}: firejail can whitelist it."
     if top in SYSTEM_TOPS:
         return "system", f"Under {top}: already visible read-only inside the sandbox; it cannot be made writable."
     return "unsupported", (f"Under {top}: firejail can only whitelist paths in $HOME or under "
-                           f"{', '.join(sorted(WHITELIST_TOPS))}. Move it or bind-mount it somewhere supported.")
+                           f"{', '.join(sorted(WHITELIST_TOPS))}. Move it somewhere supported.")
 
 
 def list_interfaces() -> list[tuple[str, str]]:
@@ -259,23 +383,21 @@ def list_interfaces() -> list[tuple[str, str]]:
     return out
 
 
-# --------------------------------------------------------------------------
 # connection attempts from `firejail --trace`
-# --------------------------------------------------------------------------
-# Format of trace lines is "<pid>:<comm>:connect <addr>:<port> ..." as far as
-# I know, but this regex is deliberately loose. If your firejail prints
-# something different, this is the one place to adjust.
+# firejail --trace lines look like "<pid>:<comm>:connect <addr>:<port> ..." as far as I know,
+# but this regex is deliberately loose. If yours prints something different, this is the one
+# place to change.
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # Two formats are supported, in priority order:
 
 # 1. Kernel netfilter LOG (preferred, from iptables -j LOG --log-prefix "wq-net: "):
 #    wq-net: IN= OUT=eth0-12345 SRC=192.168.3.88 DST=1.1.1.1 ... PROTO=TCP SPT=54321 DPT=443 ...
-#    Unaffected by process bitness, cannot be bypassed, no libtrace.so preload.
+#    Doesn't depend on process bitness, can't be bypassed, no libtrace.so preload.
 _KCONN = re.compile(
     r"wq-net(?:\[[^\]]*\])?:\s.*?\bDST=(?P<v4>\d{1,3}(?:\.\d{1,3}){3})\b"
     r".*?\bDPT=(?P<port>\d{1,5})\b")
 
-# 2. Firejail --trace format (legacy, kept for compatibility with old logs):
+# 2. firejail --trace format (legacy, kept for old logs):
 #    <pid>:<comm>:connect <fd> <addr> port <port>:<retval>
 #    Unix sockets (e.g. /run/systemd/resolve/io.systemd.Resolve) have no IP and are ignored.
 _CONNECT = re.compile(
@@ -303,6 +425,16 @@ def parse_connect(line: str) -> tuple[str, int] | None:
     if m.group("v4") and any(int(o) > 255 for o in addr.split(".")):
         return None
     return addr, port
+
+
+_KPROTO = re.compile(r"\bPROTO=(TCP|UDP)\b")
+
+
+def parse_proto(line: str) -> str:
+    """"tcp" or "udp" from a kernel firewall log line (PROTO=TCP), else "". The legacy
+    firejail trace format doesn't say, so it gives "" and the UI asks."""
+    m = _KPROTO.search(strip_ansi(line))
+    return m.group(1).lower() if m else ""
 
 
 _KGAME = re.compile(r"wq-net\[(?P<game>[^\]]*)\]:")
@@ -368,9 +500,7 @@ def allow_matches(entries: list[str], addr: str, port: int) -> bool:
     return False
 
 
-# --------------------------------------------------------------------------
 # CSS
-# --------------------------------------------------------------------------
 
 DARK = {
     "indicator_border": "#6b6b6b",
@@ -416,6 +546,244 @@ def count_alerts(text: str) -> tuple[int, int]:
     return n, sum(1 for ln in lines if "[WARN]" in ln)
 
 
+# game type: Windows or native Linux, guessed from what a source contains
+_WIN_STRONG = (".exe", ".bat", ".cmd", ".msi", ".lnk")
+_LIN_STRONG = (".sh", ".appimage", ".x86_64", ".x86", ".run", ".elf")
+_SO_RE = re.compile(r"\.so(\.\d+)*$")
+_TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2")
+_LIST_TOOLS = (".7z", ".rar", ".iso", ".img")
+TYPE_LABEL = {"wine": "Windows game", "native": "Native Linux game"}
+
+
+def classify_names(names) -> tuple[str | None, str]:
+    """("wine" | "native" | None, reason) from the file names inside a source.
+
+    Files near the top (the root, or one wrapper folder) decide first, so a Windows game
+    that ships a stray helper script is still Windows. Both kinds at the same level, or
+    neither, gives None and the user chooses."""
+    win_top, lin_top, win_all, lin_all, dll, so, mac = [], [], [], [], 0, 0, 0
+    for raw in names:
+        n = str(raw).replace("\\", "/").strip("/")
+        low = n.lower()
+        if not n or low.startswith("__macosx/"):
+            continue
+        base = low.rsplit("/", 1)[-1]
+        shallow = low.count("/") <= 1
+        if base.endswith(_WIN_STRONG):
+            win_all.append(n.rsplit("/", 1)[-1])
+            if shallow:
+                win_top.append(win_all[-1])
+        elif base.endswith(_LIN_STRONG):
+            lin_all.append(n.rsplit("/", 1)[-1])
+            if shallow:
+                lin_top.append(lin_all[-1])
+        elif base.endswith(".dll"):
+            dll += 1
+        elif _SO_RE.search(base):
+            so += 1
+        elif ".app/contents/macos/" in low:
+            mac += 1
+
+    def say(kind: str, found: list[str]) -> str:
+        more = f" and {len(found) - 1} more" if len(found) > 1 else ""
+        return f"{'Windows' if kind == 'wine' else 'Linux'} files: {found[0]}{more}"
+
+    for w, l in ((win_top, lin_top), (win_all, lin_all)):
+        if w and not l:
+            return "wine", say("wine", w)
+        if l and not w:
+            return "native", say("native", l)
+        if w and l:
+            return None, f"it has both Windows ({w[0]}) and Linux ({l[0]}) files"
+    if dll and not so:
+        return "wine", f"{dll} Windows .dll file(s), no start file"
+    if so and not dll:
+        return "native", f"{so} Linux .so file(s), no start file"
+    if mac:
+        return None, "this looks like a macOS game, which is not supported"
+    return None, "no .exe, .sh, AppImage or similar start file found"
+
+
+def _walk_names(root: Path, limit: int = 4000, max_depth: int = 4) -> list[str]:
+    out: list[str] = []
+    base = str(root)
+    for cur, dirs, files in os.walk(base, followlinks=False):
+        if cur[len(base):].count(os.sep) >= max_depth:
+            dirs[:] = []
+        for f in files:
+            rel = os.path.relpath(os.path.join(cur, f), base)
+            full = os.path.join(cur, f)
+            low = f.lower()
+            if ("." not in f and os.access(full, os.X_OK) and _is_elf(full)) or (low.endswith(".bin") and _is_elf(full)):
+                rel += ".elf"                              # an ELF without a telling name is a native binary
+            out.append(rel)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _list_archive(path: Path, limit: int = 4000) -> list[str] | None:
+    """Names inside an archive without unpacking it. None when it can't be listed."""
+    import shutil
+    import subprocess
+    import tarfile
+    import zipfile
+    low = path.name.lower()
+    try:
+        if low.endswith(".zip"):
+            with zipfile.ZipFile(path) as z:
+                return z.namelist()[:limit]
+        if low.endswith(_TAR_SUFFIXES):
+            names = []
+            with tarfile.open(path, "r:*") as t:
+                for m in t:                               # stops early; never reads the whole file
+                    names.append(m.name)
+                    if len(names) >= limit:
+                        break
+            return names
+    except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError, EOFError):
+        return None
+    if not low.endswith(_LIST_TOOLS):
+        return None
+
+    def run(cmd):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=45, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout if r.stdout else None
+
+    for exe in ("7z", "7zz", "7za"):
+        if shutil.which(exe):
+            out = run([exe, "l", "-slt", "-ba", "--", str(path)])
+            names = [ln[7:] for ln in (out or "").splitlines() if ln.startswith("Path = ")]
+            if names:
+                return names[:limit]
+    if low.endswith(".rar") and shutil.which("unrar"):
+        out = run(["unrar", "lb", "--", str(path)])
+        if out:
+            return out.splitlines()[:limit]
+    if shutil.which("bsdtar"):
+        out = run(["bsdtar", "-tf", str(path)])
+        if out:
+            return out.splitlines()[:limit]
+    return None
+
+
+def detect_source_type(source: Path | str) -> tuple[str | None, str]:
+    """Guess "wine" or "native" for a folder, archive, .iso or single file, without unpacking
+    or running anything. Returns (kind or None, why)."""
+    p = Path(source).expanduser()
+    if not p.exists():
+        return None, "source not found"
+    if p.is_dir():
+        return classify_names(_walk_names(p))
+    low = p.name.lower()
+    if low.endswith(_WIN_STRONG + _LIN_STRONG):
+        return classify_names([p.name])
+    if low.endswith((".zip",) + _TAR_SUFFIXES + _LIST_TOOLS):
+        names = _list_archive(p)
+        if names is None:
+            return None, "can't look inside it (a lister such as 7z or bsdtar may be missing)"
+        kind, why = classify_names(names)
+        return kind, why
+    try:                                                       # unknown extension: look at the first bytes
+        with p.open("rb") as f:
+            head = f.read(4)
+    except OSError as e:
+        return None, f"can't read it ({e.strerror})"
+    if head[:2] == b"MZ":
+        return "wine", "it is a Windows program (MZ header)"
+    if head == b"\x7fELF":
+        return "native", "it is a Linux program (ELF header)"
+    if head[:2] == b"#!":
+        return "native", "it is a script (starts with #!)"
+    return None, "not a program or a known archive type"
+
+
+# last run: what the game list shows in its "Last run" column
+_LEAK_RE = re.compile(r"\[LEAK\]|SANDBOX LEAK")
+_BLOCKED_RE = re.compile(r"SANDBOX-VERIFY\] (?:FAIL|ABORT)|wq: aborting launch")
+_RUN_CACHE: dict[str, tuple[tuple, tuple[str, str, float]]] = {}
+
+
+def _read_part(path: Path, tail: bool, n: int = 65536) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if tail:
+                f.seek(max(0, size - n))
+            return f.read(n).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def last_run(game_path: Path | str) -> tuple[str, str, float]:
+    """(status, short text, unix time) for the most recent run, read from the game's logs.
+
+    status is one of never, clean, notes, alert, blocked, leak. Same priority as
+    summarize-run.sh: a leak beats a blocked launch beats alerts beats warnings. The
+    launch log is read from its start, because the preflight that reports a leak or a
+    block runs before the game prints anything. The alert log is read from its end, the
+    way the Monitor tab does. Results are cached until a log changes, so calling this
+    for every game on every refresh is cheap."""
+    logs = Path(game_path) / "logs"
+    alerts = sorted(logs.glob("alerts-*.log"))
+    launches = sorted(logs.glob("launch-*.log"))
+    a_log = alerts[-1] if alerts else None
+    l_log = launches[-1] if launches else None
+    sig, stamp = [], 0.0
+    for p in (a_log, l_log):
+        try:
+            st = p.stat() if p else None
+        except OSError:
+            st = None
+        sig.append((p.name, st.st_mtime_ns, st.st_size) if st else None)
+        if st:
+            stamp = max(stamp, st.st_mtime)
+    key = str(game_path)
+    sig_t = tuple(sig)
+    hit = _RUN_CACHE.get(key)
+    if hit and hit[0] == sig_t:
+        return hit[1]
+    if not any(sig_t):
+        res = ("never", "never run", 0.0)
+    else:
+        launch_text = strip_ansi(_read_part(l_log, tail=False)) if l_log else ""
+        alert_text = _read_part(a_log, tail=True) if a_log else ""
+        status, text = run_verdict(launch_text, alert_text)
+        res = (status, text, stamp)
+    _RUN_CACHE[key] = (sig_t, res)
+    return res
+
+
+def run_verdict(launch_text: str, alert_text: str) -> tuple[str, str]:
+    """(status, short text) for one run, from its launch log (read from the start, ANSI
+    stripped) and its alert log. status is clean, notes, alert, blocked or leak. last_run and
+    the Runs tab's history strip both use this, so a run never gets two different verdicts."""
+    n_alert, n_warn = count_alerts(alert_text)
+    if _LEAK_RE.search(launch_text):
+        return "leak", "✗ sandbox leak"
+    if _BLOCKED_RE.search(launch_text):
+        return "blocked", "✗ launch blocked"
+    if n_alert:
+        return "alert", f"✗ {n_alert} alert{'s' if n_alert != 1 else ''}"
+    if n_warn:
+        return "notes", f"⚠ {n_warn} note{'s' if n_warn != 1 else ''}"
+    return "clean", "✓ clean"
+
+
+def human_ago(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
 BUILTIN_QSS = """
 * { font-size: 13px; }
 QWidget { color: @on_surface; }
@@ -457,6 +825,8 @@ QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color:
 QCheckBox { spacing: 8px; padding: 2px 0; }
 QCheckBox:disabled { color: @on_surface_variant; }
 QCheckBox[danger="true"] { color: @error; }
+QCheckBox[relaxed="true"] { color: @warn; }
+QPushButton[seg="true"]:checked { background: @primary; color: @on_primary; }
 
 /* Checkbox indicators are PNGs drawn at startup (Qt stylesheets cannot load
    data: URIs, which is why the old SVG-in-QSS check marks never showed). The
@@ -525,9 +895,7 @@ SAMPLE_CSS = """/* wq-ui custom stylesheet - reloaded automatically whenever thi
  */
 """
 
-# --------------------------------------------------------------------------
 # misc
-# --------------------------------------------------------------------------
 
 _SIZE = re.compile(r"^\d{3,5}x\d{3,5}$")
 
@@ -536,10 +904,10 @@ def valid_size(s: str) -> bool:
     return bool(_SIZE.match(s))
 
 
-# --- limits and extra firejail options ---------------------------------------
-# These mirror profile.sh (_wq_extra_arg_ok & co). profile.sh is the authority, it
-# re-checks everything at launch; this copy only lets the UI complain early.
-# test_core.py runs both on the same inputs so they cannot drift apart.
+# limits and extra firejail options
+# These mirror profile.sh (_wq_extra_arg_ok & co). profile.sh is the authority and re-checks
+# everything at launch, this copy only lets the UI complain early. test_core.py runs both on the
+# same inputs so they can't drift apart.
 
 _TASKS = re.compile(r"[1-9][0-9]{0,8}")
 _MEMORY = re.compile(r"[1-9][0-9]{0,9}[KMGT]?")
@@ -585,9 +953,7 @@ def check_extra_arg(line: str) -> str:
     return "not an allowed option"
 
 
-# --------------------------------------------------------------------------
 # checkbox images (the Qt side draws them from this)
-# --------------------------------------------------------------------------
 # token -> (border colour key, fill colour key, glyph, glyph colour key)
 CB_ICONS: dict[str, tuple[str, str, str | None, str | None]] = {
     "cb_off":       ("indicator_border", "surface", None, None),
@@ -611,9 +977,7 @@ def icon_signature(tokens: dict[str, str]) -> str:
     return hashlib.sha1("|".join(f"{k}={tokens.get(k, '')}" for k in keys).encode()).hexdigest()[:10]
 
 
-# --------------------------------------------------------------------------
 # new games and picking the exe
-# --------------------------------------------------------------------------
 
 MAX_NAME = 64
 
@@ -652,7 +1016,7 @@ def valid_exe_rel(rel: str) -> bool:
 _EXE_SKIP = ("unins*", "*redist*", "*vcredist*", "*directx*", "dxsetup*", "*crashhandler*", "*crashpad*")
 
 
-_NATIVE_EXT = (".sh", ".appimage", ".x86_64", ".x86", ".bin")
+_NATIVE_EXT = (".sh", ".appimage", ".x86_64", ".x86", ".bin", ".run")
 _NATIVE_SKIP = ("unins*", "uninstall*", "install*")
 
 
@@ -689,7 +1053,7 @@ def find_exes(gamedir: Path, runner: str = "wine", limit: int = 300, max_depth: 
             if len(out) >= limit:
                 break
     out.sort(key=lambda r: (r.count("/"), r.lower()))
-    return out
+    return out + find_prefix_exes(gamedir)       # what an installer put in the prefix comes last
 
 
 def _find_native(gamedir: Path, limit: int, max_depth: int) -> list[str]:
@@ -717,18 +1081,102 @@ def _find_native(gamedir: Path, limit: int, max_depth: int) -> list[str]:
     return out
 
 
+PREFIX_TAG = "@prefix/"      # EXE=@prefix/drive_c/... : a program an installer put into the Wine prefix
+
+
+def exe_root(gamedir: Path, exe: str) -> tuple[str, str]:
+    """-> (root directory, path relative to it). Same rule as wq_exe_root/wq_exe_rel in config.sh:
+    a plain EXE is relative to game/, an @prefix/ one to prefix/."""
+    if exe.startswith(PREFIX_TAG):
+        return str(Path(gamedir) / "prefix"), exe[len(PREFIX_TAG):]
+    return str(Path(gamedir) / "game"), exe
+
+
+def exe_path(gamedir: Path, exe: str) -> Path:
+    root, rel = exe_root(gamedir, exe)
+    return Path(root) / rel
+
+
 def exe_inside_game(gamedir: Path, rel: str) -> bool:
-    """True if <game>/game/<rel> is a real file that stays inside game/ once symlinks are resolved."""
+    """True if the program (<game>/game/<rel>, or <game>/prefix/<x> for @prefix/<x>) is a real file that
+    stays inside that folder once symlinks are resolved."""
     if not valid_exe_rel(rel):
         return False
-    base = os.path.realpath(Path(gamedir) / "game")
-    target = os.path.realpath(os.path.join(base, rel))
-    return os.path.isfile(target) and (target == base or target.startswith(base + os.sep))
+    root, sub = exe_root(gamedir, rel)
+    if not sub:
+        return False
+    base = os.path.realpath(root)
+    target = os.path.realpath(os.path.join(base, sub))
+    return os.path.isfile(target) and target.startswith(base + os.sep)
 
 
-# --------------------------------------------------------------------------
+# Folders in a Wine prefix that hold Wine/Proton/Windows itself, not something an installer added
+_PREFIX_SKIP = ("windows", "programdata/microsoft", "program files/common files", "program files (x86)/common files",
+                "program files/internet explorer", "program files (x86)/internet explorer",
+                "program files/windows media player", "program files (x86)/windows media player",
+                "program files/windows nt", "program files (x86)/windows nt", "program files/wine",
+                "program files (x86)/wine", "users/steamuser/appdata/local/temp")
+
+
+def find_prefix_exes(gamedir: Path, limit: int = 200, max_depth: int = 7) -> list[str]:
+    """Programs an installer left in prefix/drive_c, as "@prefix/drive_c/..." paths (not Wine's own files)."""
+    import fnmatch
+    base = Path(gamedir) / "prefix" / "drive_c"
+    out: list[str] = []
+    if not base.is_dir():
+        return out
+    base_s = str(base)
+    for root, dirs, files in os.walk(base_s, followlinks=False):
+        rel_root = os.path.relpath(root, base_s).lower().replace(os.sep, "/")
+        rel_root = "" if rel_root == "." else rel_root
+        dirs[:] = [d for d in dirs
+                   if (rel_root + "/" + d.lower()).lstrip("/") not in _PREFIX_SKIP
+                   and not (rel_root + "/" + d.lower()).lstrip("/").startswith("users/steamuser/appdata/local/temp")]
+        if (rel_root.count("/") + 1 if rel_root else 0) >= max_depth:
+            dirs[:] = []
+        for f in files:
+            low = f.lower()
+            if not low.endswith(".exe") or any(fnmatch.fnmatch(low, pat) for pat in _EXE_SKIP):
+                continue
+            rel = PREFIX_TAG + "drive_c/" + os.path.relpath(os.path.join(root, f), base_s).replace(os.sep, "/")
+            if valid_exe_rel(rel):
+                out.append(rel)
+        if len(out) >= limit:
+            break
+    out.sort(key=lambda r: (r.count("/"), r.lower()))
+    return out
+
+
+_SETUP_PATTERNS = ("setup*.exe", "install*.exe", "*installer*.exe", "*_setup*.exe", "*-setup*.exe",
+                   "setup*.sh", "install*.sh", "*installer*.sh", "gog_*.sh", "*.run", "*.appimage")
+
+
+def find_setups(gamedir: Path, runner: str = "wine", limit: int = 100, max_depth: int = 4) -> list[str]:
+    """Setup / installer files in game/ that look like they should be run once, as relative paths."""
+    import fnmatch
+    base = Path(gamedir) / "game"
+    out: list[str] = []
+    if not base.is_dir():
+        return out
+    native = runner == "native"
+    base_s = str(base)
+    for root, dirs, files in os.walk(base_s, followlinks=False):
+        if root[len(base_s):].count(os.sep) >= max_depth:
+            dirs[:] = []
+        for f in files:
+            low = f.lower()
+            if not any(fnmatch.fnmatch(low, pat) for pat in _SETUP_PATTERNS):
+                continue
+            if native == low.endswith(".exe"):          # wine runs .exe files, native runs everything else
+                continue
+            rel = os.path.relpath(os.path.join(root, f), base_s)
+            if valid_exe_rel(rel):
+                out.append(rel)
+    out.sort(key=lambda r: (r.count("/"), r.lower()))
+    return out[:limit]
+
+
 # /dev nodes to hide (FJ_DEV_BLOCK)
-# --------------------------------------------------------------------------
 
 # the sandbox needs these
 DEV_ESSENTIAL = {"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty",
@@ -845,9 +1293,7 @@ def list_devices(limit: int = 600) -> list[tuple[str, str, str]]:
     return out
 
 
-# --------------------------------------------------------------------------
 # launch scripts (FJ_HOOK_PRE / FJ_HOOK_POST)
-# --------------------------------------------------------------------------
 
 
 def validate_hook_path(path: str) -> tuple[bool, str]:
@@ -863,9 +1309,7 @@ def validate_hook_path(path: str) -> tuple[bool, str]:
     return True, ""
 
 
-# --------------------------------------------------------------------------
 # removing a game
-# --------------------------------------------------------------------------
 RESERVED_DIRS = {"wq-ui", "wq", "tests"}
 
 
@@ -885,6 +1329,20 @@ def validate_removal(qroot: Path, name: str) -> str:
     if not ((p / "game.conf").is_file() or (p / "game").is_dir()):
         return f"{p} does not look like a game folder (no game.conf or game/)."
     return ""
+
+
+def stash_game(qroot: Path, path: Path) -> Path:
+    """Move a game folder into <qroot>/.trash, for drives with no system Trash. It is a rename on the
+    same drive, so nothing is copied or lost. Restore by moving the folder back into qroot.
+    Returns where it went. scan_games skips dot-folders, so .trash never shows as a game."""
+    stash = Path(qroot) / ".trash"
+    stash.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest, n = stash / f"{path.name}-{stamp}", 2
+    while dest.exists():
+        dest, n = stash / f"{path.name}-{stamp}-{n}", n + 1
+    shutil.move(str(path), str(dest))
+    return dest
 
 
 def dir_size(path: Path, max_entries: int = 200_000) -> tuple[int, bool]:

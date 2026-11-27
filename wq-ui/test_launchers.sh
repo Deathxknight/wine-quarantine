@@ -3,6 +3,7 @@
 # alert counting, update-launchers.sh, term_run. firejail and inotifywait are stubs.
 #   bash wq-ui/test_launchers.sh
 set -u
+export WQ_PRESCAN=0   # these tests are not about the pre-launch scan (test_prescan.sh is)
 SRC="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 PASS=0; FAIL=0
@@ -12,7 +13,7 @@ eq()   { [ "$2" = "$3" ] && ok || fail "$1" "expected [$2] got [$3]"; }
 has()  { grep -qE -- "$2" <<< "$3" && ok || fail "$1" "no match for /$2/ in: $(head -c 400 <<< "$3")"; }
 hasnt(){ grep -qE -- "$2" <<< "$3" && fail "$1" "unexpected /$2/ in: $(head -c 400 <<< "$3")" || ok; }
 
-Q="$T/q"; mkdir -p "$Q"; cp -a "$SRC"/. "$Q"/; rm -rf "$Q/.git"
+Q="$T/q"; mkdir -p "$Q"; . "$(dirname "$(readlink -f "$0")")/test_lib.sh"; wq_copy_src "$SRC" "$Q"
 # the stub jail enforces nothing, so the in-jail verifier is off except in the test that wants it
 printf 'CLAM_SCAN_ON_ADD=0\nCLAM_SCAN_AFTER_RUN=0\nNATIVE_VERIFY="${NATIVE_VERIFY:-0}"\n' > "$Q/config.local.sh"
 
@@ -31,7 +32,9 @@ QROOT="$Q"; # shellcheck source=/dev/null
 
 mkgame() {   # mkgame <name> <start.sh body>
   local g="$Q/$1"; mkdir -p "$g/game" "$g/logs" "$g/home"
-  printf 'EXE=start.sh\nRUNNER=native\nFJ_RESTRICT_NS=0\n' > "$g/game.conf"
+  # the stub jail hides nothing, so switch off the preflight checks that would see the *host's*
+  # docker.sock / libvirt socket / /dev/input (they are not leaks of a stub, and differ per machine)
+  printf 'EXE=start.sh\nRUNNER=native\nFJ_RESTRICT_NS=0\nFJ_BLOCK_SOCKETS=0\nFJ_NOINPUT=0\nFJ_XEPHYR=0\nFJ_TASKS_MAX=\n' > "$g/game.conf"
   printf '#!/bin/bash\n%s\n' "$2" > "$g/game/start.sh"
   wq_launcher_text native > "$g/launch-quarantine.sh"
   chmod +x "$g/launch-quarantine.sh"
@@ -102,6 +105,49 @@ has "game exit code 90 reported" 'game exited with code 90' "$out"
 has "verdict is LAUNCH BLOCKED, not CLEAN" 'VERDICT: LAUNCH BLOCKED' "$out"
 hasnt "never CLEAN" 'VERDICT: CLEAN' "$out"
 
+# Real firejail can return 0 for a child that aborted in the preflight (seen in a real run: the
+# log said "ABORT: sandbox not enforced" and the verdict still read CLEAN). Same launch, but the
+# stand-in jail swallows the child's exit code.
+echo "== native launcher: blocked launch is still LAUNCH BLOCKED when firejail returns 0"
+mkdir -p "$T/bin0"; cat > "$T/bin0/firejail" <<'S'
+#!/bin/bash
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done; shift
+"$@"; exit 0
+S
+chmod +x "$T/bin0/firejail"
+mkgame leaky0 'echo SHOULD-NOT-RUN'
+out="$(cd "$Q/leaky0" && PATH="$T/bin0:$PATH" NATIVE_VERIFY=1 timeout 60 ./launch-quarantine.sh 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+hasnt "game never ran (exit 0 jail)" 'SHOULD-NOT-RUN' "$out"
+has "verdict is LAUNCH BLOCKED with exit 0" 'VERDICT: LAUNCH BLOCKED' "$out"
+hasnt "never CLEAN with exit 0" 'VERDICT: CLEAN' "$out"
+
+echo "== native launcher: a start file that is a symlink out of game/"
+mkgame symexe 'echo SHOULD-NOT-RUN'
+printf 'EXE=start.bin\nRUNNER=native\nFJ_RESTRICT_NS=0\nFJ_BLOCK_SOCKETS=0\nFJ_NOINPUT=0\nFJ_XEPHYR=0\nFJ_TASKS_MAX=\n' > "$Q/symexe/game.conf"
+printf '#!/bin/bash\necho SHOULD-NOT-RUN\n' > "$T/host-file"; chmod 600 "$T/host-file"
+rm -f "$Q/symexe/game/start.sh"; ln -s "$T/host-file" "$Q/symexe/game/start.bin"
+out="$(cd "$Q/symexe" && timeout 60 ./launch-quarantine.sh 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+has "refused with a clear message" 'start file is a symlink that points outside game/' "$out"
+hasnt "never ran" 'SHOULD-NOT-RUN' "$out"
+eq "the host file was not chmod'ed through the link" 600 "$(stat -c %a "$T/host-file")"
+
+echo "== secret-looking environment variables do not reach the game"
+mkgame envgame 'echo "tok=[${GITHUB_TOKEN-unset}] key=[${MY_API_KEY-unset}] keep=[${WQ_TEST_KEEP-unset}]"'
+out="$(cd "$Q/envgame" && GITHUB_TOKEN=hunter2 MY_API_KEY=abc WQ_TEST_KEEP=yes timeout 60 ./launch-quarantine.sh 2>&1)"
+has "token removed" 'tok=\[unset\]' "$out"; has "api key removed" 'key=\[unset\]' "$out"
+has "ordinary variables are kept" 'keep=\[yes\]' "$out"
+hasnt "the value never shows up" 'hunter2' "$out"
+out="$(cd "$Q/envgame" && GITHUB_TOKEN=hunter2 WQ_ENV_SCRUB_RE= timeout 60 ./launch-quarantine.sh 2>&1)"
+has "WQ_ENV_SCRUB_RE= turns it off" 'tok=\[hunter2\]' "$out"
+
+echo "== wq-colorize strips terminal escapes from game output"
+esc=$'\x1b'; bel=$'\x07'
+raw="$(printf 'hi %s]52;c;ZXZpbA==%s %s[2J%s[31mred\nplain\ttab\n' "$esc" "$bel" "$esc" "$esc" | WQ_FORCE_COLOR=1 "$Q/wq-colorize")"
+eq "no ESC or BEL byte from the game survives" 0 "$(printf '%s' "$raw" | LC_ALL=C tr -cd '\033\007' | wc -c)"
+has "text and tab survive" 'plain.tab' "$raw"
+has "our own colours still work" $'\x1b\\[1;97;41m ALERT' "$(printf '[ALERT] x\n' | WQ_FORCE_COLOR=1 "$Q/wq-colorize")"
+eq "a pipe or file gets the bytes untouched" "$(printf 'a%s[31mb' "$esc")" "$(printf 'a%s[31mb' "$esc" | "$Q/wq-colorize")"
+
 echo "== term_run / find_proton"
 for t in foot alacritty gnome-terminal xfce4-terminal kitty konsole; do
   printf '#!/bin/bash\necho "$(basename $0) $*"\n' > "$BIN/$t"; chmod +x "$BIN/$t"; done
@@ -113,6 +159,12 @@ PD="$T/pr"; mkdir -p "$PD/GE-Proton10-9" "$PD/GE-Proton10-10"
 touch "$PD/GE-Proton10-9/toolmanifest.vdf" "$PD/GE-Proton10-10/toolmanifest.vdf"
 PROTON_SEARCH_DIRS=("$PD"); PROTON_PREFERRED=""
 eq "newest Proton, not first alphabetically" GE-Proton10-10 "$(basename "$(find_proton '')")"
+# a prefix made by an older build keeps that build instead of being "upgraded" to the newest
+mkdir -p "$T/pg/prefix"; echo "GE-Proton10-9" > "$T/pg/prefix/version"
+eq "prefix keeps the Proton that made it" GE-Proton10-9 "$(basename "$(find_proton "$T/pg")")"
+eq "prefix version is read" GE-Proton10-9 "$(prefix_proton_version "$T/pg/prefix")"
+printf '1 GE-Proton10-10\n' > "$PD/GE-Proton10-10/version"
+eq "build version is the last word of its version file" GE-Proton10-10 "$(proton_build_version "$PD/GE-Proton10-10")"
 
 echo "== update-launchers.sh"
 mkdir -p "$Q/legacy/game/bin"

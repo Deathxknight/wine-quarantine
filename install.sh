@@ -13,7 +13,7 @@ ask()  { local a; read -r -p "$1 [y/N] " a; [[ $a =~ ^[Yy] ]]; }
 echo "wine-quarantine setup"
 echo
 
-# --- 1. location -----------------------------------------------------------
+# 1. location
 echo "Location"
 H="$(readlink -f "$HOME")"; R="$(readlink -f "$QROOT")"
 case "$R" in
@@ -36,7 +36,7 @@ case "$R" in
   *) ok "$R (outside \$HOME)" ;;
 esac
 
-# --- 2. packages -----------------------------------------------------------
+# 2. packages
 echo; echo "Packages"
 UMU_PKG=""
 if   command -v pacman >/dev/null; then PM="sudo pacman -S --needed"; PY=python;  QT=pyside6;                 EXTRA_7Z=p7zip;       UMU_PKG=umu-launcher
@@ -84,21 +84,28 @@ if command -v clamscan >/dev/null; then
   fi
 fi
 
-# --- 3. Proton --------------------------------------------------------------
-# Steam is NOT needed. Proton lives in $QROOT/_proton (outside $HOME, no sudo):
+# YARA and capa use the rule sets bundled under third_party/. Both are optional: without the
+# program the check is skipped with a note in the run log.
+command -v yara >/dev/null && command -v yarac >/dev/null || warn "yara is not installed: the YARA scan will be skipped (package 'yara')"
+command -v capa >/dev/null || warn "capa is not installed: the capa behaviour scan will be skipped (github.com/mandiant/capa, or: pip install flare-capa)"
+
+# 3. Proton
+# Steam isn't needed. Proton goes in $QROOT/_proton (outside $HOME, no sudo needed).
 # firejail --private empties $HOME, so a Proton under it is invisible to umu
 # ("toolmanifest.vdf not found").
 echo; echo "Proton"
-res() { bash -c 'cd "$1" && source ./config.sh >/dev/null 2>&1 && eval "$2"' _ "$QROOT" "$1"; }
+res()    { bash -c 'cd "$1" && source ./config.sh >/dev/null 2>&1 && shift && "$@"' _ "$QROOT" "$@"; }   # run a config.sh function
+resvar() { bash -c 'cd "$1" && source ./config.sh >/dev/null 2>&1 && printf "%s" "${!2-}"' _ "$QROOT" "$1"; }   # print a config.sh variable
 PDIR="$QROOT/_proton"
 
 # drop settings written by older versions of this script
 if [ -f config.local.sh ]; then
-  sed -i '/^QUARANTINE_EXTRA_RO_PATHS=/d' config.local.sh
+  # only the exact line old versions wrote; QUARANTINE_EXTRA_RO_PATHS is also a setting people add themselves
+  sed -i '/^QUARANTINE_EXTRA_RO_PATHS=("\/opt\/proton")[[:space:]]*$/d' config.local.sh
   if grep -q "^PROTON_PREFERRED=.*$H" config.local.sh 2>/dev/null; then sed -i '/^PROTON_PREFERRED=/d' config.local.sh; fi
 fi
 
-PROTON="$(res 'find_proton')"
+PROTON="$(res find_proton)"
 in_home() { case "$1" in "$H"/*) return 0 ;; *) return 1 ;; esac; }
 
 fetch_ge_proton() {   # download + sha512-verify the latest GE-Proton into $PDIR
@@ -121,16 +128,27 @@ print(a[t]); print(a.get(s, ""))
 PY
   ) || { bad "could not query GitHub for the latest GE-Proton"; rm -rf "$tmp"; return 1; }
   url="${U[0]:-}"; sum="${U[1]:-}"
+  # the API reply is data from the network: only the project's own GitHub release assets are fetched
+  local base="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/"
+  case "$url" in "$base"*) ;; *) bad "unexpected download address, refusing: ${url:0:120}"; rm -rf "$tmp"; return 1 ;; esac
+  case "$sum" in ""|"$base"*) ;; *) bad "unexpected checksum address, refusing: ${sum:0:120}"; rm -rf "$tmp"; return 1 ;; esac
+  local CURL=(curl --proto '=https' --proto-redir '=https' --tlsv1.2)
   [ -n "$url" ] || { bad "no GE-Proton tarball found in the latest release"; rm -rf "$tmp"; return 1; }
   echo "  downloading $(basename "$url") (~500MB)"
-  curl -fL --progress-bar -o "$tmp/$(basename "$url")" "$url" || { bad "download failed"; rm -rf "$tmp"; return 1; }
-  if [ -n "$sum" ] && curl -fsSL -o "$tmp/sum" "$sum"; then
-    ( cd "$tmp" && sha512sum -c sum >/dev/null 2>&1 ) && ok "checksum verified" \
+  "${CURL[@]}" -fL --progress-bar -o "$tmp/$(basename "$url")" "$url" || { bad "download failed"; rm -rf "$tmp"; return 1; }
+  if [ -n "$sum" ] && "${CURL[@]}" -fsSL -o "$tmp/sum" "$sum"; then
+    ( cd "$tmp" && grep -qF -- "$(basename "$url")" sum && sha512sum -c sum >/dev/null 2>&1 ) && ok "checksum verified" \
       || { bad "checksum mismatch, refusing to install"; rm -rf "$tmp"; return 1; }
   else
-    warn "no checksum published for this release, skipping verification"
+    # fail closed: an unverifiable download is not installed unless the user says so explicitly
+    if [ "${WQ_ALLOW_UNVERIFIED_DOWNLOAD:-0}" != 1 ]; then
+      bad "no checksum published for this release: refusing to install an unverified download"
+      echo "      (set WQ_ALLOW_UNVERIFIED_DOWNLOAD=1 to install it anyway)"
+      rm -rf "$tmp"; return 1
+    fi
+    warn "no checksum published for this release, installing unverified (WQ_ALLOW_UNVERIFIED_DOWNLOAD=1)"
   fi
-  mkdir -p "$PDIR" && tar -xf "$tmp/$(basename "$url")" -C "$PDIR"; local rc=$?
+  mkdir -p "$PDIR" && tar -xf "$tmp/$(basename "$url")" -C "$PDIR" --no-same-owner --no-same-permissions; local rc=$?
   rm -rf "$tmp"; return $rc
 }
 
@@ -145,7 +163,7 @@ if [ -z "$PROTON" ] || in_home "$PROTON"; then
     bad "no Proton build found"
     LOCAL_TGZ="$(ls -t "$HOME"/Downloads/GE-Proton*.tar.gz 2>/dev/null | head -n1 || true)"
     if [ -n "$LOCAL_TGZ" ] && ask "  Install $(basename "$LOCAL_TGZ") from ~/Downloads into $PDIR?"; then
-      mkdir -p "$PDIR" && tar -xf "$LOCAL_TGZ" -C "$PDIR" && ok "extracted"
+      mkdir -p "$PDIR" && tar -xf "$LOCAL_TGZ" -C "$PDIR" --no-same-owner --no-same-permissions && ok "extracted"
     elif ask "  Download the latest GE-Proton from GitHub into $PDIR?"; then
       fetch_ge_proton && ok "installed"
     else
@@ -154,18 +172,18 @@ if [ -z "$PROTON" ] || in_home "$PROTON"; then
       echo "      tar -xf ~/Downloads/GE-Proton*.tar.gz -C \"$PDIR\""
     fi
   fi
-  PROTON="$(res 'find_proton')"
+  PROTON="$(res find_proton)"
 fi
 
 if [ -z "$PROTON" ]; then bad "still no Proton build; fix this and re-run"
 elif in_home "$PROTON"; then bad "Proton is still under \$HOME ($PROTON); the sandbox cannot see it"
 else ok "Proton: $PROTON"; fi
 
-UMU="$(res 'echo $LUTRIS_UMU')"
+UMU="$(resvar LUTRIS_UMU)"
 if [ -n "$UMU" ] && [ -x "$UMU" ]; then ok "umu-run: $UMU"
 else bad "umu-run not found. Install umu-launcher or set LUTRIS_UMU in config.local.sh"; fi
 
-# --- 4. umu runtime (one-time download) -------------------------------------
+# 4. umu runtime (one-time download)
 echo; echo "umu runtime"
 UMU_DATA="$QROOT/_umu-data"
 mkdir -p "$UMU_DATA/umu"
@@ -200,7 +218,7 @@ else
   else bad "umu runtime setup failed (exit code $rc). Check your connection and Proton architecture, then run install.sh again."; fi
 fi
 
-# --- 5. integration + launcher ---------------------------------------------
+# 5. integration + launcher
 echo; echo "wq-ui"
 if grep -q "wq-ui integration" _launch-core.sh 2>/dev/null; then ok "integration already applied"
 else echo "  applying integration..."; python3 wq-ui/integrate.py && ok "integration applied"; fi
@@ -212,26 +230,16 @@ WQ
 chmod +x wq
 ok "created ./wq"
 
-if ask "  Add an application-menu entry?"; then
-  mkdir -p ~/.local/share/applications
-  cat > ~/.local/share/applications/wine-quarantine.desktop <<DESK
-[Desktop Entry]
-Type=Application
-Name=Wine Quarantine
-Comment=Run Windows games in a firejail sandbox
-Exec=$QROOT/wq
-Terminal=false
-Categories=Game;
-DESK
-  ok "menu entry added"
+if ask "  Add an application-menu entry (with the logo)?"; then
+  if bash wq-ui/install-menu.sh >/dev/null; then ok "menu entry and icons added"
+  else bad "could not add the menu entry. Run wq-ui/install-menu.sh by hand to see why."; fi
 fi
 
-# --- 6. network logging ------------------------------------------------------
-# The sandbox runs in its own network namespace, and the kernel only writes
-# netfilter LOG lines from namespaces other than the host's when
-# net.netfilter.nf_log_all_netns=1. Without it the Network tab stays empty even
-# though connections are being made. Opt-in: it is a system-wide setting, and it
-# also lets other containers/namespaces write into the host kernel log.
+# 6. network logging
+# The sandbox has its own network namespace, and the kernel only writes netfilter LOG lines from
+# namespaces other than the host's if net.netfilter.nf_log_all_netns=1. Without it the Network tab
+# stays empty even though connections happen. Opt-in because it's system-wide and also lets other
+# containers write into the host kernel log.
 echo; echo "Network logging (Network tab)"
 NFKEY=/proc/sys/net/netfilter/nf_log_all_netns
 if [ "$(cat "$NFKEY" 2>/dev/null)" = 1 ]; then
@@ -258,7 +266,7 @@ else
   fi
 fi
 
-# --- 7. final check ----------------------------------------------------------
+# 7. final check
 echo; echo "Final check"
 if bash -c 'cd "$1" && source ./config.sh && check_deps' _ "$QROOT"; then
   ok "all dependencies satisfied"

@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, Qt
+from PySide6.QtCore import QObject, QProcess, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar,
@@ -16,8 +17,15 @@ from PySide6.QtWidgets import (
 
 import wq_core as core
 
-ARCHIVE_TOOLS = {".zip": "unzip", ".rar": "unrar", ".7z": "7z", ".tar": "tar", ".gz": "tar", ".tgz": "tar",
-                 ".xz": "tar", ".txz": "tar", ".bz2": "tar", ".tbz2": "tar"}
+# any one of these programs unpacks the format
+ARCHIVE_TOOLS = {".zip": ("unzip", "7z", "7zz", "7za"), ".rar": ("unrar",), ".7z": ("7z", "7zz", "7za"), ".tar": ("tar",),
+                 ".gz": ("tar",), ".tgz": ("tar",), ".xz": ("tar",), ".txz": ("tar",), ".bz2": ("tar",),
+                 ".tbz2": ("tar",), ".iso": ("7z", "7zz", "7za", "bsdtar")}
+
+
+class _TypeDetector(QObject):
+    """Carries the result of the type guess from its worker thread back to the dialog."""
+    done = Signal(int, object, str)
 
 
 def _note(text: str = "", status: str | None = None, hint: bool = False) -> QLabel:
@@ -54,9 +62,7 @@ def kill_group(p: QProcess, sig=signal.SIGTERM):
         p.terminate()
 
 
-# ---------------------------------------------------------------------------
 # add a game
-# ---------------------------------------------------------------------------
 class NewGameDialog(QDialog):
     """Runs new-quarantine.sh or new-native.sh. With several candidate files the
     script would ask which one, so stdin is closed (it takes the first) and the
@@ -76,10 +82,24 @@ class NewGameDialog(QDialog):
         form = QFormLayout()
 
         self.kind = QComboBox()
+        self.kind.addItem("Auto-detect from the source", "auto")
         self.kind.addItem("Windows game (Wine / Proton)", "wine")
         self.kind.addItem("Native Linux game (shell script or binary)", "native")
-        self.kind.currentIndexChanged.connect(self._validate)
+        self.kind.currentIndexChanged.connect(self._type_changed)
         form.addRow("Type", self.kind)
+        self.type_note = _note("", hint=True)
+        form.addRow("", self.type_note)
+
+        self.detected_kind: str | None = None        # what the guess came back with
+        self.detected_why = ""
+        self._detecting = False
+        self._detect_token = 0
+        self._detector = _TypeDetector(self)
+        self._detector.done.connect(self._detected)
+        self._detect_timer = QTimer(self)
+        self._detect_timer.setSingleShot(True)
+        self._detect_timer.setInterval(350)
+        self._detect_timer.timeout.connect(self._start_detect)
 
         self.name = QLineEdit()
         self.name.setPlaceholderText("e.g. My Game")
@@ -90,8 +110,8 @@ class NewGameDialog(QDialog):
         h = QHBoxLayout(src_row)
         h.setContentsMargins(0, 0, 0, 0)
         self.source = QLineEdit()
-        self.source.setPlaceholderText("Optional - a folder, an archive (.zip .rar .7z .tar.gz …), or a single file")
-        self.source.textChanged.connect(self._validate)
+        self.source.setPlaceholderText("Optional - a folder, an archive (.zip .rar .7z .tar.gz …), an .iso, or a single file")
+        self.source.textChanged.connect(self._source_changed)
         self.b_file = QPushButton("File…")
         self.b_dir = QPushButton("Folder…")
         self.b_file.clicked.connect(self._pick_file)
@@ -105,9 +125,9 @@ class NewGameDialog(QDialog):
         self.note = _note("", "warn")
         v.addWidget(self.note)
         v.addWidget(_note(
-            "The source is copied or unpacked into <name>/game/ inside your wine-quarantine folder; the original is "
-            "left alone. With no source you get an empty quarantine to drop files into yourself. If several .exe "
-            "files are found you can pick the right one afterwards.", hint=True))
+            "The source is copied or unpacked into <name>/game/; the original is left alone. An .iso is "
+            "unpacked, never mounted. With no source you get an empty Windows quarantine. If several start "
+            "files are found you pick one afterwards.", hint=True))
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -135,13 +155,14 @@ class NewGameDialog(QDialog):
         bar.addWidget(self.btn_create)
         v.addLayout(bar)
 
+        self._refresh_type_note()
         self._validate()
 
     # -- input
     def _pick_file(self):
         f, _ = QFileDialog.getOpenFileName(
             self, "Game executable or archive", str(Path.home()),
-            "Games and archives (*.exe *.sh *.AppImage *.zip *.rar *.7z *.tar *.tar.gz *.tgz *.tar.xz *.tar.bz2);;"
+            "Games and archives (*.exe *.bat *.sh *.AppImage *.iso *.zip *.rar *.7z *.tar *.tar.gz *.tgz *.tar.xz *.tar.bz2);;"
             "All files (*)")
         if f:
             self._set_source(f)
@@ -157,6 +178,75 @@ class NewGameDialog(QDialog):
             stem = Path(path).stem if Path(path).is_file() else Path(path).name
             self.name.setText(stem.replace("_", " ").strip())
 
+    def _effective_kind(self) -> str | None:
+        sel = self.kind.currentData()
+        if sel in ("wine", "native"):
+            return sel
+        if self.detected_kind:
+            return self.detected_kind
+        return "wine" if not self.source.text().strip() else None     # an empty quarantine stays Windows
+
+    def _type_changed(self, *_):
+        self._refresh_type_note()
+        self._validate()
+
+    def _source_changed(self, *_):
+        self._detect_token += 1
+        self.detected_kind, self.detected_why = None, ""
+        self._detecting = bool(self.source.text().strip())
+        if self._detecting:
+            self._detect_timer.start()
+        else:
+            self._detect_timer.stop()
+        self._refresh_type_note()
+        self._validate()
+
+    def _start_detect(self):
+        src, token = self.source.text().strip(), self._detect_token
+        if not src:
+            return
+
+        def work():
+            try:
+                kind, why = core.detect_source_type(src)
+            except Exception as e:                      # a bad guess must never break the dialog
+                kind, why = None, f"could not inspect it ({e})"
+            try:
+                self._detector.done.emit(token, kind, why)
+            except RuntimeError:                        # dialog closed while we were looking
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _detected(self, token: int, kind, why: str):
+        if token != self._detect_token:
+            return                                      # the source changed since; ignore the stale answer
+        self._detecting = False
+        self.detected_kind, self.detected_why = kind, why
+        self._refresh_type_note()
+        self._validate()
+
+    def _refresh_type_note(self):
+        sel, src = self.kind.currentData(), self.source.text().strip()
+        text, status = "", None
+        if not src:
+            if sel == "auto":
+                text = "No source, so this will be an empty Windows quarantine. Pick Native Linux above for a Linux one."
+        elif self._detecting:
+            text = "Looking at the source…"
+        elif self.detected_kind and sel == "auto":
+            text = f"Detected: {core.TYPE_LABEL[self.detected_kind]} ({self.detected_why})."
+        elif self.detected_kind and sel != self.detected_kind:
+            text = (f"This looks like a {core.TYPE_LABEL[self.detected_kind]} ({self.detected_why}), "
+                    f"but you chose {core.TYPE_LABEL[sel]}.")
+            status = "warn"
+        elif not self.detected_kind and sel == "auto":
+            text = f"Couldn't tell the type: {self.detected_why or 'unknown'}. Choose one above."
+            status = "warn"
+        self.type_note.setText(text)
+        self.type_note.setProperty("status", status or "")
+        _repolish(self.type_note)
+        self.type_note.setVisible(bool(text))
+
     def _validate(self) -> bool:
         err = core.validate_game_name(self.name.text(), self.existing, self.qroot)
         src = self.source.text().strip()
@@ -165,14 +255,17 @@ class NewGameDialog(QDialog):
             if not sp.exists():
                 err = f"Source not found: {src}"
             elif sp.is_file():
-                tool = ARCHIVE_TOOLS.get(sp.suffix.lower())
-                if tool and not shutil.which(tool):
-                    err = f"{sp.suffix} archives need “{tool}”, which is not installed."
+                tools = ARCHIVE_TOOLS.get(sp.suffix.lower())
+                if tools and not any(shutil.which(t) for t in tools):
+                    err = (f"{sp.suffix} files need “{tools[0]}”" +
+                           (f" (or {', '.join(tools[1:])})" if len(tools) > 1 else "") + ", which is not installed.")
         if self.name.text() == "":
             err = ""               # don't nag before the first keystroke
         self.note.setText(err)
         self.note.setVisible(bool(err))
         ok = not err and bool(self.name.text().strip())
+        if ok and self._effective_kind() is None:          # the guess failed or is still running
+            ok = False
         self.btn_create.setEnabled(ok and self.proc is None)
         return ok
 
@@ -187,7 +280,8 @@ class NewGameDialog(QDialog):
     def _create(self):
         if not self._validate():
             return
-        script = (self.qroot / "wq-ui" / "new-native.sh" if self.kind.currentData() == "native"
+        kind = self._effective_kind()
+        script = (self.qroot / "wq-ui" / "new-native.sh" if kind == "native"
                   else self.qroot / "new-quarantine.sh")
         if not script.is_file():
             QMessageBox.critical(self, "Missing script", f"{script} not found.")
@@ -198,6 +292,8 @@ class NewGameDialog(QDialog):
         if src:
             args.append(str(Path(src).expanduser()))
         self.log.clear()
+        how = "auto-detected" if self.kind.currentData() == "auto" and self.detected_kind else "chosen"
+        self.log.appendPlainText(f"Type: {core.TYPE_LABEL[kind]} ({how})")
         self.log.appendPlainText(f"$ {script.name} {' '.join(repr(a) for a in args)}")
         p = QProcess(self)
         p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -264,9 +360,7 @@ class NewGameDialog(QDialog):
         super().reject()
 
 
-# ---------------------------------------------------------------------------
 # /dev picker
-# ---------------------------------------------------------------------------
 class DevicePickerDialog(QDialog):
     """Pick /dev nodes to hide. Essential ones aren't listed, risky ones get a note."""
 
@@ -277,9 +371,8 @@ class DevicePickerDialog(QDialog):
         self.setMinimumSize(640, 480)
         v = QVBoxLayout(self)
         v.addWidget(_note(
-            "Hidden devices disappear from /dev inside the sandbox (firejail --blacklist). Everything else under /dev "
-            "stays visible, so this is for hardening beyond the Block audio / webcam / U2F… boxes. "
-            "Take care with GPU and input nodes: the game stops seeing them.", hint=True))
+            "Hidden devices are removed from /dev inside the sandbox (--blacklist). Everything else stays "
+            "visible. Careful with GPU and input nodes: the game loses them.", hint=True))
 
         top = QHBoxLayout()
         self.search = QLineEdit()
@@ -354,9 +447,7 @@ class DevicePickerDialog(QDialog):
         return out
 
 
-# ---------------------------------------------------------------------------
 # executable picker
-# ---------------------------------------------------------------------------
 class ExePickerDialog(QDialog):
     def __init__(self, gamedir: Path, current: str = "", parent=None, note: str = "", runner: str = "wine"):
         super().__init__(parent)

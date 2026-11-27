@@ -1,4 +1,4 @@
-import sys, os, tempfile
+import re, sys, os, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wq_core as c
@@ -68,6 +68,32 @@ defs, rest = c.split_css(src); assert defs == {"primary": "#ff0000", "on_surface
 out = c.substitute_tokens(rest, {**c.DARK, **defs}); assert "color: #ff0000" in out and "@unknown" in out
 assert "@" not in c.substitute_tokens(c.BUILTIN_QSS, c.DARK) and "@" not in c.substitute_tokens(c.BUILTIN_QSS, c.LIGHT)
 print("css tokens: ok; all builtin QSS tokens resolve in both themes")
+
+# --- themes
+import wq_themes as th
+for t in th.THEME_LIST:
+    assert t.mode in ("dark", "light") and set(th.TOKEN_KEYS) <= set(t.tokens), t.id
+    tok, qss = th.resolve_tokens(t, t.mode)
+    sheet = c.substitute_tokens(c.BUILTIN_QSS + qss, tok)
+    assert "@" not in sheet, (t.id, "unresolved token")
+    assert th.contrast(tok["on_surface"], tok["surface"]) >= 4.5, (t.id, "text on surface")
+    assert th.contrast(tok["on_primary"], tok["primary"]) >= 4.5, (t.id, "text on primary")
+    assert th.contrast(tok["on_surface_variant"], tok["surface"]) >= 3.0, (t.id, "muted text")
+    assert th.contrast(tok["error"], tok["surface"]) >= 3.0 and th.contrast(tok["warn"], tok["surface"]) >= 3.0, t.id
+    assert c.icon_signature(tok)
+assert len(th.THEMES) == len(th.THEME_LIST)
+td = Path(tempfile.mkdtemp())
+(td / "mine.css").write_text("/* theme: Mine */\n@define-color mode light;\n@define-color primary #123456;\nQPushButton { color: @primary; }\n")
+(td / "empty.css").write_text("QPushButton { color: red; }\n")
+ut = th.load_user_themes(td)
+assert [u.id for u in ut] == ["user:mine"] and ut[0].label == "Mine" and ut[0].mode == "light"
+tok, qss = th.resolve_tokens(ut[0], "light"); assert tok["primary"] == "#123456" and tok["surface"] == c.LIGHT["surface"]
+assert "user:mine" in th.all_themes(td) and "cyberpunk" in th.all_themes(td)
+for t in th.THEME_LIST:                      # same for the built-in pixel theme's frames and font
+    for ref in re.findall(r'url\("@assets/([^")]+)"\)', t.qss):
+        assert (th.ASSETS_DIR / ref).is_file(), (t.id, ref)
+assert "pixel" in th.THEMES and list((th.ASSETS_DIR / "fonts").glob("PixelifySans-*.ttf"))
+print(f"themes: ok ({len(th.THEME_LIST)} built in, contrast checked, user themes load)")
 
 # --- game names
 d2 = Path(tempfile.mkdtemp()); (d2/"Taken").mkdir()
@@ -209,4 +235,90 @@ assert c.count_alerts("[t] [ALERT] Kill switch triggered - terminating sandbox.\
 assert c.count_alerts("[t] [ALERT] a\n[t] [ALERT] b\n[t] [ALERT] ClamAV: ... and 3 more detection(s)\n") == (2, 0)
 print("alert counting ok")
 
+
+# ---- last run (the game list's "Last run" column)
+import time as _time
+_g = d/"lastrun"; (_g/"logs").mkdir(parents=True)
+assert c.last_run(_g)[0] == "never"
+(_g/"logs"/"launch-20261001-100000.log").write_text("starting\n")
+(_g/"logs"/"alerts-20261001-100000.log").write_text("[t] [INFO] Monitor started\n")
+assert c.last_run(_g)[:2] == ("clean", "✓ clean")
+(_g/"logs"/"alerts-20261001-100000.log").write_text("[t] [WARN] x\n[t] [WARN] y\n")
+assert c.last_run(_g)[:2] == ("notes", "⚠ 2 notes"), c.last_run(_g)      # cache must notice the change
+(_g/"logs"/"alerts-20261001-100000.log").write_text("[t] [ALERT] curl\n[t] [ALERT] Kill switch triggered - terminating sandbox.\n")
+assert c.last_run(_g)[:2] == ("alert", "✗ 1 alert")
+(_g/"logs"/"launch-20261002-100000.log").write_text("\x1b[31m[SANDBOX-VERIFY] FAIL: x\x1b[0m\n")
+assert c.last_run(_g)[0] == "blocked"                                    # newest launch log wins over old alerts
+(_g/"logs"/"launch-20261003-100000.log").write_text("ok\n[LEAK] resolver socket reachable\n")
+assert c.last_run(_g)[0] == "leak"
+assert abs(c.last_run(_g)[2] - _time.time()) < 30
+assert c.human_ago(5) == "just now" and c.human_ago(300) == "5m ago" and c.human_ago(7200) == "2h ago" and c.human_ago(3*86400) == "3d ago"
+print("last run summary ok")
+
+
+# ---- game type detection
+import zipfile, tarfile, subprocess
+assert c.classify_names(["Game/Game.exe", "Game/data.pak"])[0] == "wine"
+assert c.classify_names(["start.sh", "bin/game"])[0] == "native"
+assert c.classify_names(["a.BAT"])[0] == "wine" and c.classify_names(["Run.CMD"])[0] == "wine" and c.classify_names(["x.msi"])[0] == "wine"
+assert c.classify_names(["Game.AppImage"])[0] == "native" and c.classify_names(["g/Game.x86_64"])[0] == "native"
+assert c.classify_names(["Game.exe", "Game.sh"])[0] is None                      # same level, both: user decides
+assert c.classify_names(["Game.exe", "tools/deep/x/y/fix.sh"])[0] == "wine"      # top level wins over a deep helper
+assert c.classify_names(["start.sh", "wine/deep/a/b/setup.exe"])[0] == "native"
+assert c.classify_names(["x/UnityPlayer.dll", "x/data.assets"])[0] == "wine"     # no start file, only dlls
+assert c.classify_names(["libfoo.so.1", "libbar.so"])[0] == "native"
+assert c.classify_names(["__MACOSX/a.exe", "Game.app/Contents/MacOS/game"])[0] is None
+assert c.classify_names(["readme.txt"])[0] is None and c.classify_names([])[0] is None
+# real sources
+ty = d/"types"; ty.mkdir()
+(ty/"w").mkdir(); (ty/"w"/"Setup.EXE").write_bytes(b"MZ")
+(ty/"n").mkdir(); (ty/"n"/"run").write_bytes(b"\x7fELF" + b"\0" * 20); os.chmod(ty/"n"/"run", 0o755)
+(ty/"e").mkdir(); (ty/"e"/"notes.txt").write_text("hi")
+assert c.detect_source_type(ty/"w")[0] == "wine" and c.detect_source_type(ty/"n")[0] == "native"
+assert c.detect_source_type(ty/"e")[0] is None and c.detect_source_type(ty/"missing")[0] is None
+with zipfile.ZipFile(ty/"g.zip", "w") as z: z.writestr("My Game/game.exe", "x"); z.writestr("My Game/data/a.bin", "x")
+assert c.detect_source_type(ty/"g.zip")[0] == "wine"
+with zipfile.ZipFile(ty/"l.zip", "w") as z: z.writestr("start.sh", "x")
+assert c.detect_source_type(ty/"l.zip")[0] == "native"
+(ty/"src").mkdir(); (ty/"src"/"go.sh").write_text("#!/bin/sh\n")
+with tarfile.open(ty/"l.tar.gz", "w:gz") as t: t.add(ty/"src"/"go.sh", arcname="go.sh")
+assert c.detect_source_type(ty/"l.tar.gz")[0] == "native"
+(ty/"bad.zip").write_text("not a zip"); assert c.detect_source_type(ty/"bad.zip")[0] is None
+for name, body, want in (("prog.exe", b"x", "wine"), ("thing", b"MZ\x90\0", "wine"), ("thing2", b"\x7fELFxxxx", "native"),
+                         ("scr", b"#!/bin/bash\n", "native"), ("note", b"hello", None), ("setup.bat", b"@echo off", "wine")):
+    (ty/name).write_bytes(body); assert c.detect_source_type(ty/name)[0] == want, name
+# .iso / .7z / .rar go through an external lister; a fake 7z checks we run it and parse its -slt output
+fake = ty/"bin"; fake.mkdir()
+(fake/"7z").write_text("#!/bin/sh\nprintf 'Path = AUTORUN.INF\\nSize = 10\\n\\nPath = Setup.exe\\nSize = 5\\n'\n"); os.chmod(fake/"7z", 0o755)
+(ty/"disc.iso").write_bytes(b"x")
+_old_path = os.environ["PATH"]; os.environ["PATH"] = f"{fake}:{_old_path}"
+try:
+    assert c.detect_source_type(ty/"disc.iso")[0] == "wine", c.detect_source_type(ty/"disc.iso")
+finally:
+    os.environ["PATH"] = _old_path
+os.environ["PATH"] = "/nonexistent"
+try:
+    k, why = c.detect_source_type(ty/"disc.iso"); assert k is None and "lister" in why, (k, why)
+finally:
+    os.environ["PATH"] = _old_path
+print("game type detection ok")
+
+# presets
+_keys = {o.key for o in c.BOOL_OPTS} | set(c.NET_BOOLS)
+for _n, _p in c.PRESETS.items():
+    assert set(_p) <= _keys and all(_p[k] for k in c.PRESET_FLOOR), _n      # real keys, hard floor always on
+    assert c.preset_match(_p) == _n
+assert {o.key for o in c.BOOL_OPTS} <= set(c.PLAIN) and set(c.ADVANCED_KEYS) <= _keys
+assert c.preset_match({**c.PRESETS["Strict"], "FJ_NOSOUND": False}) == "Custom"
+assert c.preset_match({**c.PRESETS["Strict"], "FJ_NOSOUND": None}) == "Custom"   # games disagree
+assert c.is_relaxed("FJ_NOSOUND", False) and not c.is_relaxed("FJ_NOSOUND", True) and c.is_relaxed("FJ_NET", True)
+assert not c.is_relaxed("FJ_XEPHYR", False)                                       # not part of Strict
+print("presets ok")
+
+
+# protocol from the kernel log line
+assert c.parse_proto("wq-net[G]: IN= OUT=eth0 SRC=1.2.3.4 DST=5.6.7.8 LEN=60 PROTO=TCP SPT=1 DPT=443") == "tcp"
+assert c.parse_proto("\x1b[33mwq-net: DST=5.6.7.8 PROTO=UDP DPT=53\x1b[0m") == "udp"
+assert c.parse_proto("wq-net: DST=5.6.7.8 PROTO=ICMP") == "" and c.parse_proto("1234:game:connect 5 1.2.3.4 port 80:0") == ""
+print("parse_proto ok")
 print("\nALL CORE TESTS PASSED")

@@ -1,12 +1,12 @@
 #!/bin/bash
 # _launch-native.sh <GameName>  (called by a native game's launch-quarantine.sh)
-# Runs a native Linux game (script or binary) with the same firejail profile
-# setup and monitor as the Wine games, minus Wine/umu/Proton.
+# Runs a native Linux game (script or binary) with the same firejail profile setup and monitor
+# as the Wine games, minus Wine/umu/Proton.
 #
 # What's different from _launch-core.sh:
 #  * only <game>/game/ is writable (plus anything whitelisted in wq-ui)
 #  * with "Hide home directory" on, $HOME is <game>/home so saves persist
-#  * verify-sandbox.sh isn't run, it was written for the Wine setup
+#  * verify-sandbox.sh runs in its native mode (the Wine-only checks are skipped)
 #  * no registry snapshot: home-diff.sh does the same job for startup files, autostart
 #    entries, systemd user units, ~/.local/bin, ~/.ssh and new executables in game/
 #  * monitor.sh runs in native mode (lib-monitor-native.sh) because game.conf has RUNNER=native
@@ -16,6 +16,8 @@ set -euo pipefail
 QROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # shellcheck source=/dev/null
 source "$QROOT/config.sh" || { echo "FATAL: cannot load $QROOT/config.sh" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$QROOT/lib-firejail.sh" || { echo "FATAL: cannot load $QROOT/lib-firejail.sh" >&2; exit 1; }
 for b in firejail inotifywait; do
   command -v "$b" >/dev/null 2>&1 || { echo "FATAL: $b is not installed" >&2; exit 1; }
 done
@@ -33,15 +35,29 @@ export GAMEDIR
 
 [ "$(read_game_conf "$GAMEDIR" RUNNER || true)" = "native" ] || {
   echo "Error: $GAMENAME is not a native game (no RUNNER=native in game.conf)" >&2; exit 1; }
-EXE="$(read_game_conf "$GAMEDIR" EXE)" || { echo "Error: no EXE= line in $GAMEDIR/game.conf" >&2; exit 1; }
-[ "$EXE" != "CHANGE_ME.sh" ] && [ "$EXE" != "CHANGE_ME.exe" ] || { echo "Error: set EXE= in $GAMEDIR/game.conf first" >&2; exit 1; }
+# WQ_RUN_EXE (wq-ui's "Run setup file") runs one other file from game/ for this launch only, e.g. an installer
+# script. Have it install into the game folder (it is the only writable place besides the private home).
+if [ -n "${WQ_RUN_EXE:-}" ]; then
+  EXE="$WQ_RUN_EXE"
+  case "$EXE" in @prefix/*) echo "Error: @prefix/ programs are for Wine games" >&2; exit 1 ;; esac
+  echo "wq: one-time run of $EXE (EXE= in game.conf is not changed)"
+else
+  EXE="$(read_game_conf "$GAMEDIR" EXE)" || { echo "Error: no EXE= line in $GAMEDIR/game.conf" >&2; exit 1; }
+  [ "$EXE" != "CHANGE_ME.sh" ] && [ "$EXE" != "CHANGE_ME.exe" ] || { echo "Error: set EXE= in $GAMEDIR/game.conf first" >&2; exit 1; }
+fi
 valid_exe_rel "$EXE" || { echo "Error: bad EXE path in game.conf" >&2; exit 1; }
 
 EXEDIR="$(readlink -f "$GAMEDIR/game/$(dirname "$EXE")")"
 case "$EXEDIR/" in "$GAMEDIR/game/"*) ;; *) echo "Error: start directory resolves outside game/" >&2; exit 1 ;; esac
 EXE_NAME="$(basename "$EXE")"
 [ -f "$EXEDIR/$EXE_NAME" ] || { echo "Error: not found: $EXEDIR/$EXE_NAME" >&2; exit 1; }
-case "$EXE_NAME" in *.sh) ;; *) chmod u+x "$EXEDIR/$EXE_NAME" ;; esac
+# the start file may be a symlink the game planted on an earlier run. chmod below follows links,
+# so it has to resolve inside game/ before anything touches it
+case "$(readlink -f "$EXEDIR/$EXE_NAME")" in
+  "$GAMEDIR/game/"*) ;;
+  *) echo "Error: the start file is a symlink that points outside game/" >&2; exit 1 ;;
+esac
+case "$EXE_NAME" in *.sh|*.SH) ;; *) chmod u+x "$EXEDIR/$EXE_NAME" ;; esac
 
 LOGDIR="$GAMEDIR/logs"; mkdir -p "$LOGDIR"
 ALERTLOG="$LOGDIR/alerts-$(date +%Y%m%d-%H%M%S).log"
@@ -55,9 +71,19 @@ trap 'STOP_REQUESTED=1' TERM INT HUP
 find "$LOGDIR" -maxdepth 1 -type f \( -name 'alerts-*.log' -o -name 'launch-*.log' \) \
   -mtime +"${LOG_RETENTION_DAYS:-30}" -delete 2>/dev/null || true
 
+# pre-launch scan: refuses the launch on a ClamAV detection, out-of-date signatures or a high static
+# risk score (wq-prescan.sh; PRESCAN=0 in game.conf turns it off for this game)
+if ! "$QROOT/wq-prescan.sh" "$GAMENAME" --alertlog "$ALERTLOG"; then
+  echo "wq: aborting launch"
+  sleep 1   # the tee'd launch log has to flush: summarize-run.sh reads the line above from it
+  "$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" 97 || true
+  exit 97
+fi
+
 echo "wq: native launch of $GAMENAME ($EXE)."
 
 export WQ_RUNNER=native
+wq_scrub_env_args   # sets WQ_ENV_SCRUB: "-u NAME" for every secret-looking variable of this shell
 WQ_LIMITS_SUPPORTED=1   # the firejail call below uses WQ_LIMIT_PREFIX
 apply_game_profile "$GAMEDIR"
 
@@ -81,7 +107,8 @@ export WQ_MONITOR_HOME WQ_MONITOR_PRIVATE
 # after the run: home diff + ClamAV scan + summary
 post_run() {   # post_run <game exit code>
   "$QROOT/home-diff.sh" compare "$GAMEDIR" "$ALERTLOG" || true
-  "$QROOT/wq-scan.sh" "$GAMENAME" --when run --alertlog "$ALERTLOG" || true
+  wq_post_scan wq-scan.sh "$GAMENAME" --when run --alertlog "$ALERTLOG"
+  wq_post_scan wq-yara.sh "$GAMENAME" --when run --alertlog "$ALERTLOG"
   sleep 1   # let the tee'd launch log flush
   "$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" "$1" || true
 }
@@ -100,26 +127,33 @@ export WQ_NATIVE_VERIFY QVERIFY_MODE=native QVERIFY_GAMEDIR="$GAMEDIR"
 mapfile -t -O "${#WL_ARGS[@]}" WL_ARGS < <(profile_extra_whitelist_args)
 mapfile -t BL_ARGS < <(build_blacklist_args)
 
+[ "$STOP_REQUESTED" -eq 0 ] || { echo "Stopped before the game started."; exit 130; }
+
 export WQ_EXE_NAME="$EXE_NAME"
 cd "$EXEDIR"
 
+# dry-run the exact firejail arguments: if firejail refuses them the game must not be reported as run
+if ! wq_firejail_check "${FJ_ARGS[@]}" "${WL_ARGS[@]}" "${BL_ARGS[@]}"; then
+  sleep 1   # the tee'd launch log has to flush: summarize-run.sh reads the line above from it
+  "$QROOT/summarize-run.sh" "$GAMEDIR" "$ALERTLOG" 97 || true
+  exit 97
+fi
+
 "$QROOT/home-diff.sh" snapshot "$GAMEDIR"
 
-${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK \
+${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u SSH_AUTH_SOCK ${WQ_ENV_SCRUB[@]+"${WQ_ENV_SCRUB[@]}"} \
   firejail "${FJ_ARGS[@]}" "${WL_ARGS[@]}" "${BL_ARGS[@]}" -- \
     bash -c '
-      # preflight: refuse to start the game if the jail is leaking (honours the
-      # profile opt-outs in QVERIFY_SKIP). First the generic verifier (capabilities, seccomp,
-      # network, ...), then the extra native checks below.
+      # preflight: refuse to start the game if the jail is leaking (QVERIFY_SKIP lists the
+      # profile opt-outs). First the generic verifier, then the extra native checks below.
       if [ "${WQ_NATIVE_VERIFY:-0}" = 1 ]; then
         "$0/verify-sandbox.sh" || exit $?
       fi
       bad=0; sk=",${QVERIFY_SKIP:-},"
       has() { case "$sk" in *",$1,"*) return 1 ;; *) return 0 ;; esac; }
       leak() { echo "wq: SANDBOX LEAK: $*" >&2; bad=1; }
-      # group membership is only a note: firejail ignores --nogroups on NVIDIA
-      # systems, and what the groups would grant (sockets, /dev/input, sudo) is
-      # checked directly below and by --nonewprivs.
+      # group membership is only a note: firejail ignores --nogroups on NVIDIA systems, and what the
+      # groups would grant (sockets, /dev/input, sudo) is checked directly below and by --nonewprivs.
       if has groups; then
         for g in docker input libvirt wheel disk kvm; do
           id -nG | tr " " "\n" | grep -qx "$g" && echo "wq: note: still in group $g (resources are blocked separately)" >&2
@@ -146,15 +180,18 @@ ${WQ_LIMIT_PREFIX[@]+"${WQ_LIMIT_PREFIX[@]}"} env -u DBUS_SESSION_BUS_ADDRESS -u
       fi
       [ "$bad" = 0 ] || { echo "wq: aborting launch" >&2; exit 97; }
       case "$WQ_EXE_NAME" in
-        *.sh) exec bash "./$WQ_EXE_NAME" ;;
+        *.sh|*.SH) exec bash "./$WQ_EXE_NAME" ;;
+        # An AppImage mounts itself with FUSE, which needs fusermount (setuid) and /dev/fuse: neither
+        # works in a jail with no capabilities and no_new_privs. Have it unpack into the private /tmp instead.
+        *.[Aa][Pp][Pp][Ii][Mm][Aa][Gg][Ee]) export APPIMAGE_EXTRACT_AND_RUN=1; exec "./$WQ_EXE_NAME" ;;
         *)    exec "./$WQ_EXE_NAME" ;;
       esac
     ' "$QROOT" &
 GAME_PID=$!
 
-# Start the monitor at once. A native game is running within milliseconds, and whatever it does in
-# the first seconds would go unwatched if the monitor waited. If the game is already gone (a quick
-# script, a failed start) the monitor simply ends.
+# Start the monitor right away. A native game is running within milliseconds and anything it does
+# in the first seconds would go unwatched if the monitor waited. If the game is already gone
+# (a quick script, a failed start) the monitor just ends.
 "$QROOT/monitor.sh" "$GAMEDIR" "$GAME_PID" "$ALERTLOG" >>"$LOGDIR/monitor.out" 2>&1 &
 MONITOR_PID=$!
 

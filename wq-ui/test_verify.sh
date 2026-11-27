@@ -13,7 +13,7 @@ eq()   { [ "$2" = "$3" ] && ok || fail "$1" "expected [$2] got [$3]"; }
 has()  { grep -qE -- "$2" <<< "$3" && ok || fail "$1" "no match for /$2/ in: $(head -c 500 <<< "$3")"; }
 hasnt(){ grep -qE -- "$2" <<< "$3" && fail "$1" "unexpected /$2/ in: $(head -c 500 <<< "$3")" || ok; }
 
-Q="$T/q"; mkdir -p "$Q"; cp -a "$SRC"/. "$Q"/; rm -rf "$Q/.git"
+Q="$T/q"; mkdir -p "$Q"; . "$(dirname "$(readlink -f "$0")")/test_lib.sh"; wq_copy_src "$SRC" "$Q"
 
 echo "== shipped hash matches the script"
 eq "verify-sandbox.sha256 is current" "$(sha256sum "$SRC/verify-sandbox.sh" | cut -d' ' -f1)" "$(tr -d '[:space:]' < "$SRC/verify-sandbox.sha256")"
@@ -36,14 +36,32 @@ eq "several lines" "/a /c " "$multi"
 
 echo "== native mode (checks that need a real jail are skipped, as a profile would)"
 G="$T/game1"; mkdir -p "$G/game"
-SKIP="caps,nnp,seccomp,sockets"
-run() { ( cd "$T" && env "$@" bash "$Q/verify-sandbox.sh" 2>&1; echo "rc=$?" ); }
+SKIP="caps,nnp,seccomp,sockets,input,ipc,protocol,ns,mdwx"
+# Run the verifier in a mount namespace whose propagation is "slave", which is what firejail sets up.
+# Without this the result depends on the host: systemd hosts mount / as shared, and the propagation
+# check would (correctly) fail on them. If no namespace can be made, run directly.
+PRIV=()
+if   unshare -m --propagation slave true 2>/dev/null;  then PRIV=(unshare -m --propagation slave)
+elif unshare -Urm --propagation slave true 2>/dev/null; then PRIV=(unshare -Urm --propagation slave)
+fi
+run() { ( cd "$T" && env -u SSH_AUTH_SOCK -u DBUS_SESSION_BUS_ADDRESS "$@" ${PRIV[@]+"${PRIV[@]}"} bash "$Q/verify-sandbox.sh" 2>&1; echo "rc=$?" ); }
 out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP" QVERIFY_NET=filtered)"
 has "native mode passes with only game/ present" 'rc=0$' "$out"
 has "reports the native home note" 'native mode: .*HOME' "$out"
 hasnt "does not ask for prefix/" 'prefix' "$out"
 hasnt "does not ask for UMU_DATA" 'UMU_DATA' "$out"
 has "mount propagation was checked" 'no shared mounts visible' "$out"
+
+# FJ_MDWX / FJ_MEMFD checks: skipped by the profile, and when not skipped they report what the host allows
+out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP" QVERIFY_NET=filtered)"
+has "mdwx check skipped by profile" 'write\+execute memory check skipped by profile' "$out"
+has "memfd check skipped by profile" 'memfd_create check skipped by profile' "$out"
+out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="${SKIP/,mdwx/}" QVERIFY_NET=filtered)"
+if python3 -c 'import mmap; mmap.mmap(-1, 4096, prot=mmap.PROT_READ|mmap.PROT_WRITE|mmap.PROT_EXEC)' 2>/dev/null; then
+  has "an unfiltered host fails the write+execute check" 'FJ_MDWX not in effect' "$out"
+else
+  has "a filtered host passes the write+execute check" 'writable\+executable memory is refused' "$out"
+fi
 
 touch "$G/game.conf"
 out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP" QVERIFY_NET=filtered)"
@@ -55,7 +73,7 @@ mkdir "$G/.home-snapshot"
 out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP" QVERIFY_NET=filtered)"
 has "snapshot dir visible fails" '\.home-snapshot is visible' "$out"; rmdir "$G/.home-snapshot"
 
-out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="caps,nnp,sockets" QVERIFY_NET=filtered)"
+out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="caps,nnp,sockets,ipc,protocol,ns,mdwx" QVERIFY_NET=filtered)"
 has "a missing seccomp filter fails without the profile opt-out" 'rc=90$' "$out"
 rm -rf "$G/game"
 out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP" QVERIFY_NET=filtered)"
@@ -65,6 +83,33 @@ has "ssh agent in the environment fails" 'SSH_AUTH_SOCK=/x' "$out"
 out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP" QVERIFY_NET=filtered DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus)"
 has "real session bus in the environment fails" 'reaches real bus' "$out"
 
+echo "== same-user control sockets in the runtime dir"
+RT="$T/rt"; mkdir -p "$RT"
+SKIP2="caps,nnp,seccomp,ipc,protocol,ns,mdwx"      # sockets check stays ON here
+out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP2" QVERIFY_NET=open WQ_RUNTIME_DIR="$RT")"
+has "nothing in the runtime dir passes" 'no systemd/gpg/ssh-agent socket visible' "$out"
+mkdir "$RT/systemd"
+out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP2" QVERIFY_NET=open WQ_RUNTIME_DIR="$RT")"
+has "systemd/ visible fails the check" 'same-user control socket visible:.*/systemd' "$out"; has "exit 90" 'rc=90$' "$out"
+rmdir "$RT/systemd"; touch "$RT/ssh-agent.socket"
+out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP2" QVERIFY_NET=open WQ_RUNTIME_DIR="$RT")"
+has "an ssh-agent socket fails it too" 'ssh-agent.socket' "$out"
+# firejail --blacklist leaves a placeholder behind: /dev/null for a file, a mode-000 dir for a dir.
+# The name still exists, but nothing behind it is reachable, so it must not count as a leak.
+rm -f "$RT/ssh-agent.socket"; ln -s /dev/null "$RT/ssh-agent.socket"
+out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP2" QVERIFY_NET=open WQ_RUNTIME_DIR="$RT")"
+has "a blacklisted file (/dev/null placeholder) passes" 'no systemd/gpg/ssh-agent socket visible' "$out"
+rm -f "$RT/ssh-agent.socket"
+# root can enter a mode-000 dir (and unshare -Urm makes us root), so this one needs a real normal user
+if [ "$(id -u)" != 0 ] && [ "${PRIV[1]:-}" != "-Urm" ]; then
+  mkdir "$RT/gnupg"; chmod 000 "$RT/gnupg"
+  out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP2" QVERIFY_NET=open WQ_RUNTIME_DIR="$RT")"
+  has "a blacklisted dir (mode 000 placeholder) passes" 'no systemd/gpg/ssh-agent socket visible' "$out"
+  chmod 700 "$RT/gnupg"; rmdir "$RT/gnupg"
+fi
+out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP2,sockets" QVERIFY_NET=open WQ_RUNTIME_DIR="$RT")"
+has "the profile opt-out skips it" 'user runtime socket check skipped' "$out"
+
 echo "== windows mode is unchanged"
 out="$(run QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP")"
 has "still requires UMU_DATA" 'QVERIFY_UMU_DATA' "$out"
@@ -72,13 +117,24 @@ mkdir -p "$G/prefix" "$T/umu"
 out="$(run QVERIFY_GAMEDIR="$G" QVERIFY_UMU_DATA="$T/umu" QVERIFY_HOST_USER=u QVERIFY_SKIP="$SKIP,home" QVERIFY_NET=filtered)"
 has "windows mode checks prefix/ and UMU_DATA" 'prefix/ visible' "$out"; has "and UMU_DATA" 'UMU_DATA visible' "$out"
 
+echo "== \$HOME contents (windows mode)"
+HM="$T/fakehome"; mkdir -p "$HM/.config/pulse"; : > "$HM/.config/pulse/client.conf"; : > "$HM/.bashrc"
+homerun() { run HOME="$HM" QVERIFY_GAMEDIR="$G" QVERIFY_UMU_DATA="$T/umu" QVERIFY_HOST_USER=u QVERIFY_SKIP="$SKIP" QVERIFY_NET=filtered; }
+out="$(homerun)"; has "firejail's own .config/pulse/client.conf is accepted" 'HOME contains only expected shell files' "$out"
+mkdir "$HM/.config/chromium"
+out="$(homerun)"; has "a real-looking .config is a leak" 'HOME/\.config present - real home leaked \(contains: .*chromium' "$out"
+rm -rf "$HM/.config/chromium"; : > "$HM/.config/pulse/secret"
+out="$(homerun)"; has "unexpected files inside .config/pulse are a leak" 'HOME/\.config present' "$out"
+rm -f "$HM/.config/pulse/secret"; mkdir "$HM/.ssh"
+out="$(homerun)"; has "other home entries are still a leak" 'HOME/\.ssh present' "$out"
+
 echo "== self-hash"
 cp "$Q/verify-sandbox.sh" "$Q/verify-sandbox.sh.good"; echo '# tampered' >> "$Q/verify-sandbox.sh"
 out="$(run QVERIFY_MODE=native QVERIFY_GAMEDIR="$G" QVERIFY_SKIP="$SKIP")"
 has "an edited verifier is refused (exit 91)" 'rc=91$' "$out"; mv "$Q/verify-sandbox.sh.good" "$Q/verify-sandbox.sh"
 
 echo "== WQ_VERIFY_SKIP_EXTRA reaches QVERIFY_SKIP"
-printf 'FJ_SECCOMP=0\n' > "$T/g.conf"
+printf 'FJ_SECCOMP=0\nFJ_XEPHYR=0\nFJ_TASKS_MAX=\n' > "$T/g.conf"
 sk() {   # sk [extra tokens]: QVERIFY_SKIP as apply_game_profile computes it for a game with FJ_SECCOMP=0
   ( cd "$Q" && QROOT="$Q" . ./config.sh >/dev/null 2>&1; mkdir -p "$T/gx"; cp "$T/g.conf" "$T/gx/game.conf"
     [ $# -gt 0 ] && WQ_VERIFY_SKIP_EXTRA="$1"

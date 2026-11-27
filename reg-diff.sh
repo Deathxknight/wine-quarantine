@@ -4,17 +4,19 @@
 
 MODE="$1"
 GAMEDIR="$2"
+# shellcheck source=lib-clean.sh
+. "$(dirname "$(readlink -f "$0")")/lib-clean.sh" || exit 2
 SNAPDIR="$GAMEDIR/.reg-snapshot"
 PREFIX="$GAMEDIR/prefix"
-REGFILES="system.reg user.reg userdef.reg"
+REGFILES=(system.reg user.reg userdef.reg)
 
 # Wine writes a registry as
 #   [Software\\Microsoft\\Windows\\CurrentVersion\\Run] 1699999999
 #   #time=1da0123456789ab
 #   "Name"="C:\\path\\game.exe"
-# (key paths have DOUBLED backslashes, and every key header is followed by a #time line, so the
-# first value is the second line after the header, not the first). A plain diff cannot say which
-# key a changed value line belongs to, so both files are flattened to "key<TAB>value" lines first.
+# Key paths have DOUBLED backslashes, and every key header is followed by a #time line, so the
+# first value is the second line after the header. A plain diff can't tell which key a changed
+# value line belongs to, so both files are flattened to "key<TAB>value" lines first.
 BS='\\\\'    # ERE for two literal backslashes
 PERSIST_NAMES='Run|RunOnce|RunServices|RunServicesOnce|Image File Execution Options|AppInit_DLLs|Winlogon|ShellServiceObjectDelayLoad|SharedTaskScheduler|AppCertDlls|SilentProcessExit|KnownDLLs|Browser Helper Objects'
 # a key path segment, not a substring: Software\\Foo\\Runtime must not count as ...\\Run
@@ -49,8 +51,9 @@ persist_hits() {
 case "$MODE" in
   snapshot)
     mkdir -p "$SNAPDIR"
-    for f in $REGFILES; do
-      if [ -f "$PREFIX/$f" ]; then
+    for f in "${REGFILES[@]}"; do
+      # a hive that is a symlink is never copied: it could point at a huge file or a host secret
+      if [ -f "$PREFIX/$f" ] && [ ! -L "$PREFIX/$f" ]; then
         cp -f "$PREFIX/$f" "$SNAPDIR/$f.before"
       fi
     done
@@ -62,20 +65,25 @@ case "$MODE" in
     DIFFLOG="$GAMEDIR/logs/regdiff-$(date +%Y%m%d-%H%M%S).log"
     RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'; NC='\033[0m'
     log() {
-      local level="$1" msg="$2"
+      local level="$1" msg; msg="$(wq_clean_text "$2")"   # key names and values come from the game
       local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
       echo "[$ts] [$level] $msg" >> "$ALERTLOG"
       case "$level" in
-        ALERT) echo -e "${RED}[$ts] [ALERT] $msg${NC}" ;;
-        WARN)  echo -e "${YEL}[$ts] [WARN]  $msg${NC}" ;;
-        INFO)  echo -e "${GRN}[$ts] [INFO]  $msg${NC}" ;;
+        ALERT) printf '%b[%s] [ALERT] %s%b\n' "$RED" "$ts" "$msg" "$NC" ;;
+        WARN)  printf '%b[%s] [WARN]  %s%b\n' "$YEL" "$ts" "$msg" "$NC" ;;
+        INFO)  printf '%b[%s] [INFO]  %s%b\n' "$GRN" "$ts" "$msg" "$NC" ;;
       esac
     }
 
     FOUND_ANYTHING=0
-    for f in $REGFILES; do
+    for f in "${REGFILES[@]}"; do
       BEFORE="$SNAPDIR/$f.before"
       AFTER="$PREFIX/$f"
+      if [ -L "$AFTER" ]; then
+        FOUND_ANYTHING=1
+        log ALERT "Registry hive $f is a symlink (to $(wq_clean_text "$(readlink "$AFTER" | head -c 160)")): a game has no reason to do that"
+        continue
+      fi
       [ -f "$BEFORE" ] || continue
       [ -f "$AFTER" ] || continue
 
@@ -127,8 +135,8 @@ case "$MODE" in
     [ "$FOUND_ANYTHING" -eq 0 ] && log INFO "Registry unchanged vs pre-run snapshot"
 
 
-    for f in $REGFILES; do
-      if [ -f "$PREFIX/$f" ]; then
+    for f in "${REGFILES[@]}"; do
+      if [ -f "$PREFIX/$f" ] && [ ! -L "$PREFIX/$f" ]; then
         cp -f "$PREFIX/$f" "$SNAPDIR/$f.before"
       fi
     done

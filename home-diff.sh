@@ -2,18 +2,20 @@
 # home-diff.sh snapshot <GAMEDIR>                 -- take a pre-run snapshot
 # home-diff.sh compare  <GAMEDIR> <ALERTLOG>      -- diff against it, log the results
 #
-# The native-game counterpart of reg-diff.sh. A Windows game that wants to persist writes a
-# registry key; a Linux one writes a startup file. This snapshots those places in the
-# game's effective $HOME (WQ_MONITOR_HOME, default <game>/home) plus the list of executable
-# files under game/, and reports what changed. It catches what the live monitor can miss
-# (inotify queue overflow, a write racing the jail setup, a rename over an existing file).
+# Native counterpart of reg-diff.sh. A Windows game that wants to persist writes a registry key,
+# a Linux one writes a startup file. This snapshots those places in the game's $HOME
+# (WQ_MONITOR_HOME, default <game>/home) plus the list of executables under game/, then reports
+# what changed. It catches what the live monitor can miss: inotify queue overflow, a write racing
+# the jail setup, a rename over an existing file.
 #
-# Like reg-diff.sh, compare accepts the new state as the next baseline.
+# Like reg-diff.sh, compare takes the new state as the next baseline.
 
 MODE="${1:-}"
 GAMEDIR="${2:-}"
 [ -n "$MODE" ] && [ -n "$GAMEDIR" ] || { echo "usage: home-diff.sh {snapshot|compare} <GAMEDIR> [ALERTLOG]"; exit 1; }
 GAMEDIR="$(readlink -f "$GAMEDIR")"
+# shellcheck source=lib-clean.sh
+. "$(dirname "$(readlink -f "$0")")/lib-clean.sh" || exit 2
 SNAPDIR="$GAMEDIR/.home-snapshot"
 HOME_DIR="${WQ_MONITOR_HOME:-$GAMEDIR/home}"
 HOME_DIR="${HOME_DIR%/}"
@@ -65,13 +67,13 @@ case "$MODE" in
     NOTE=""
     [ "${WQ_MONITOR_PRIVATE:-1}" = 1 ] || NOTE=" (home is NOT hidden: this may be another program, not the game)"
     log() {
-      local level="$1" msg="${2//[[:cntrl:]]/}" ts
+      local level="$1" msg ts; msg="$(wq_clean_text "$2")"
       ts=$(date '+%Y-%m-%d %H:%M:%S')
       echo "[$ts] [$level] $msg" >> "$ALERTLOG"
       case "$level" in
-        ALERT) echo -e "${RED}[$ts] [ALERT] $msg${NC}" ;;
-        WARN)  echo -e "${YEL}[$ts] [WARN]  $msg${NC}" ;;
-        INFO)  echo -e "${GRN}[$ts] [INFO]  $msg${NC}" ;;
+        ALERT) printf '%b[%s] [ALERT] %s%b\n' "$RED" "$ts" "$msg" "$NC" ;;
+        WARN)  printf '%b[%s] [WARN]  %s%b\n' "$YEL" "$ts" "$msg" "$NC" ;;
+        INFO)  printf '%b[%s] [INFO]  %s%b\n' "$GRN" "$ts" "$msg" "$NC" ;;
       esac
     }
 
@@ -84,6 +86,8 @@ case "$MODE" in
     NOW="$(mktemp -d)"; trap 'rm -rf "$NOW"' EXIT
     take "$NOW"
 
+    # RC_FILES includes .config/fish/config.fish, which the .config/* rule below would only warn about
+    is_rc_file() { local f; for f in "${RC_FILES[@]}"; do [ "$1" = "$f" ] && return 0; done; return 1; }
     is_alert_path() { local p; for p in "${ALERT_PREFIXES[@]}"; do case "$1" in "$p"/*) return 0 ;; esac; done; return 1; }
 
     # name -> hash maps
@@ -105,9 +109,9 @@ case "$MODE" in
       fi
       FOUND=1
       echo "$kind  ~/$name" >> "$DIFFLOG"
-      case "$name" in
+      is_rc_file "$name" && lvl=ALERT || case "$name" in
         .config/*|.local/*|.ssh/*) if is_alert_path "$name"; then lvl=ALERT; else lvl=WARN; fi ;;
-        *) lvl=ALERT ;;     # one of RC_FILES
+        *) lvl=ALERT ;;
       esac
       log "$lvl" "Home diff: $kind ~/$name$NOTE"
     done
