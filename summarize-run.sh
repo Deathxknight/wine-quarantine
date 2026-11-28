@@ -16,6 +16,25 @@ LAUNCHLOG_LATEST=$(ls -t "$GAMEDIR/logs"/launch-*.log 2>/dev/null | head -n1)
 LEAK_COUNT=0
 [ -n "$LEAKS" ] && LEAK_COUNT=$(printf '%s\n' "$LEAKS" | grep -c '^')
 
+# Warnings the launcher and firejail printed while setting up the jail ("Warning: NVIDIA card detected, nogroups command
+# ignored", "wq: not hiding /mnt: ...", "wq: left visible: ..."). They only reach the launch log, so without this the
+# verdict could say less than the log knows. Lines that are plain progress or that explain a blocked launch are left out.
+LAUNCH_WARNS=""; DEGRADED_LINES=""
+if [ -n "$LAUNCHLOG_LATEST" ]; then
+  _lw=$(sed 's/\x1b\[[0-9;]*m//g' "$LAUNCHLOG_LATEST" 2>/dev/null | wq_clean_stream \
+        | grep -E '^(Warning: |wq: |\[SANDBOX-VERIFY\] DEGRADED)' \
+        | grep -vE '^wq: (native launch|one-time run|game exited|running |pre-launch scan|note: still in group|\(WQ_EXTRACT_SANDBOX|aborting launch|SANDBOX LEAK|refusing to launch|firejail refused|hardened helper|using the previous|   )' \
+        | awk '!seen[$0]++' || true)
+  LAUNCH_WARNS="$_lw"
+  DEGRADED_LINES=$(printf '%s\n' "$_lw" | grep -E 'DEGRADED|ignored|not in effect' || true)
+fi
+LAUNCH_WARN_COUNT=0
+[ -n "$LAUNCH_WARNS" ] && LAUNCH_WARN_COUNT=$(printf '%s\n' "$LAUNCH_WARNS" | grep -c '^')
+DEGRADED_COUNT=0
+[ -n "$DEGRADED_LINES" ] && DEGRADED_COUNT=$(printf '%s\n' "$DEGRADED_LINES" | grep -c '^')
+# what the live monitor could not see in this run (poll gaps, unwatched /tmp)
+COVERAGE=$(grep -E 'Monitor coverage|NOT watched|not watched|NOT hidden' "$ALERTLOG" 2>/dev/null | sed 's/^\[[^]]*\] \[[A-Z]*\] //' | wq_clean_stream | awk '!seen[$0]++' || true)
+
 RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'; BOLD='\033[1m'; NC='\033[0m'
 
 ALERTS=$(grep "\[ALERT\]" "$ALERTLOG" 2>/dev/null | wq_clean_stream || true)
@@ -71,14 +90,19 @@ if [ "$LEAK_COUNT" -gt 0 ]; then
   echo -e "${RED}${BOLD}VERDICT: SANDBOX LEAK${NC} — the jail exposed $LEAK_COUNT thing(s) to the game."
 elif [ "$BLOCKED" -eq 1 ]; then
   echo -e "${RED}${BOLD}VERDICT: LAUNCH BLOCKED${NC} — a preflight check failed, the game never ran."
-elif [ "$ALERT_COUNT" -eq 0 ] && [ "$WARN_COUNT" -eq 0 ]; then
+elif [ "$ALERT_COUNT" -eq 0 ] && [ "$WARN_COUNT" -eq 0 ] && [ "$LAUNCH_WARN_COUNT" -eq 0 ]; then
   echo -e "${GRN}${BOLD}VERDICT: CLEAN${NC} — no suspicious activity detected."
 elif [ "$ALERT_COUNT" -eq 0 ]; then
-  echo -e "${YEL}${BOLD}VERDICT: OK, minor notes${NC} — no alerts, $WARN_COUNT informational warning(s)."
+  echo -e "${YEL}${BOLD}VERDICT: OK, minor notes${NC} — no alerts, $WARN_COUNT informational warning(s), $LAUNCH_WARN_COUNT launch warning(s)."
 else
   echo -e "${RED}${BOLD}VERDICT: REVIEW NEEDED${NC} — $ALERT_COUNT alert(s) flagged."
 fi
 echo
+
+if [ "$DEGRADED_COUNT" -gt 0 ] && [ "$BLOCKED" -eq 0 ]; then
+  echo -e "${YEL}${BOLD}SANDBOX DEGRADED${NC} — $DEGRADED_COUNT protection(s) the profile asked for are not in effect (see Launch warnings)."
+  echo
+fi
 
 if [ "$LEAK_COUNT" -gt 0 ]; then
   echo -e "${RED}--- Sandbox leaks ---${NC}"
@@ -101,6 +125,18 @@ fi
 if [ "$WARN_COUNT" -gt 0 ]; then
   echo -e "${YEL}--- Warnings (informational) ---${NC}"
   printf '%s\n' "$WARNS" | sed 's/^/  /'
+  echo
+fi
+
+if [ "$LAUNCH_WARN_COUNT" -gt 0 ] && [ "$BLOCKED" -eq 0 ]; then
+  echo -e "${YEL}--- Launch warnings (from the launch log) ---${NC}"
+  printf '%s\n' "$LAUNCH_WARNS" | sed 's/^/  /'
+  echo
+fi
+
+if [ -n "$COVERAGE" ]; then
+  echo -e "${YEL}--- Monitor coverage (what this run could not see) ---${NC}"
+  printf '%s\n' "$COVERAGE" | sed 's/^/  /'
   echo
 fi
 

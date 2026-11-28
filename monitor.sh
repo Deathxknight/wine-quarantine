@@ -196,7 +196,10 @@ if [ "$MODE" = wine ]; then
   fi
 fi
 
-log INFO "Monitor started for $GAMEDIR (firejail pid $FIREJAIL_PID, mode: $MODE)"
+# A native game is judged the first time a process is seen (see the loop below), so how often the process table is read
+# is the shortest life a child can have and still be inspected. Native default is 1s; NATIVE_POLL_INTERVAL overrides it.
+[ "$MODE" = native ] && POLL_INTERVAL="${NATIVE_POLL_INTERVAL:-1}"
+log INFO "Monitor started for $GAMEDIR (firejail pid $FIREJAIL_PID, mode: $MODE, process poll every ${POLL_INTERVAL:-5}s)"
 [ "$KILL_ON_ALERT" = 1 ] || log WARN "Kill switch is OFF for this game (MONITOR_KILL=0): alerts are logged, the sandbox keeps running"
 # Wine needs a moment to set up. A native game does not, so watching starts at once for those.
 if [ "$MODE" = wine ]; then sleep 2; fi
@@ -210,9 +213,11 @@ rm -f "$NATIVE_SUPPRESSED.n"
 declare -A RC_BASE=()
 
 # one event from either native inotify pipeline: classify, then log
+declare -A FS_REPORTED=()
+TMP_PREFIX=""      # /proc/<pid>/root once the game's private /tmp is being watched
 native_fs_event() {
   local event="$1" file="$2" res level kind msg
-  res="$(native_classify_path "$file" "$event" "$NHOME" "$GAMEBIN")" || return 0
+  res="$(native_classify_path "$file" "$event" "$NHOME" "$GAMEBIN" "$TMP_PREFIX")" || return 0
   [ -n "$res" ] || return 0
   IFS=$'\t' read -r level kind msg <<< "$res"
   if [ "$kind" = rc ]; then
@@ -223,6 +228,9 @@ native_fs_event() {
     native_is_skeleton "$file" "$rel" && return 0   # firejail's own skeleton file
   fi
   if [ "$level" = WARN ]; then
+    # one WARN per file: a write is followed by a chmod, a rename, a second write...
+    [ -n "${FS_REPORTED[$file]:-}" ] && return 0
+    FS_REPORTED[$file]=1
     # a first-run unpack can write thousands of files: log the first few, count the rest
     local n=0
     [ -f "$NATIVE_SUPPRESSED.n" ] && n=$(wc -l < "$NATIVE_SUPPRESSED.n")
@@ -261,7 +269,8 @@ if [ "$MODE" = native ]; then
   esac
 
   NATIVE_EXCLUDE='/(\.cache|mesa_shader_cache[^/]*|shader_cache|GPUCache|Code Cache)(/|$)'
-  NATIVE_EVENTS=(-e create -e moved_to -e close_write)
+  # attrib: a file written earlier and chmod +x'd later is only visible as an attribute change
+  NATIVE_EVENTS=(-e create -e moved_to -e close_write -e attrib)
   if [ "${#R_PATHS[@]}" -gt 0 ]; then
     (
       inotifywait -m -r "${NATIVE_EVENTS[@]}" --exclude "$NATIVE_EXCLUDE" --format '%e|%w%f' "${R_PATHS[@]}" 2>/dev/null |
@@ -278,6 +287,52 @@ if [ "$MODE" = native ]; then
   fi
   [ "${#NATIVE_PIDS[@]}" -eq 0 ] && log WARN "nothing to watch - filesystem monitoring disabled"
 fi
+
+# ---- native mode: the game's own /tmp, /var/tmp and /dev/shm ---------------------------------------------------
+# With --private-tmp the game's /tmp is a tmpfs inside the jail's mount namespace: the host's /tmp (and any watch on
+# it) never sees it. It is reachable as /proc/<pid>/root/tmp for any process that lives inside the jail, so the monitor
+# starts one more inotify watcher there as soon as such a process exists. The one thing the monitor cannot do is
+# watch a directory it cannot reach, so every way this can fail says so in the log instead of staying silent.
+TMP_STATE=""              # "" = not tried yet, on, off
+TMP_TRIES=0
+TMP_TRY_MAX="${NATIVE_TMP_TRIES:-10}"
+native_try_watch_tmp() {   # native_try_watch_tmp <pid of a process of the sandbox>
+  local pid="$1" mine theirs d host jail
+  local -a shared=() priv=()
+  mine="$(readlink /proc/self/ns/mnt 2>/dev/null)" || mine=""
+  theirs="$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)" || return 1
+  # firejail itself (and its helpers) live in the host's mount namespace: wait for a process inside the jail
+  [ -n "$theirs" ] && [ "$theirs" != "$mine" ] || return 1
+  for d in /tmp /var/tmp /dev/shm; do
+    [ -d "/proc/$pid/root$d" ] || continue
+    host="$(stat -c %d:%i "$d" 2>/dev/null)" || continue
+    jail="$(stat -c %d:%i "/proc/$pid/root$d" 2>/dev/null)" || continue
+    if [ "$host" = "$jail" ]; then shared+=("$d"); else priv+=("/proc/$pid/root$d"); fi
+  done
+  if [ "${#priv[@]}" -eq 0 ] && [ "${#shared[@]}" -eq 0 ]; then
+    TMP_TRIES=$((TMP_TRIES+1))
+    if [ "$TMP_TRIES" -ge "$TMP_TRY_MAX" ]; then
+      TMP_STATE=off
+      log WARN "The game's /tmp could not be reached from the monitor (no readable /proc/$pid/root/tmp): files and scripts the game puts in /tmp are NOT watched in this run"
+    fi
+    return 1
+  fi
+  TMP_STATE=on
+  [ "${#shared[@]}" -gt 0 ] && log WARN "The game shares the host's ${shared[*]} (no --private-tmp for them): not watched, other programs write there too"
+  if [ "${#priv[@]}" -gt 0 ]; then
+    TMP_PREFIX="/proc/$pid/root"
+    ( inotifywait -m -r "${NATIVE_EVENTS[@]}" \
+        --exclude '/(\.X11-unix|\.ICE-unix|\.XIM-unix|\.font-unix|\.mount_[^/]*|_MEI[^/]*|appimage_extracted_[^/]*|\.org\.chromium\.[^/]*)(/|$)' \
+        --format '%e|%w%f' "${priv[@]}" 2>/dev/null |
+      while IFS='|' read -r event file; do native_fs_event "$event" "$file"; done ) &
+    NATIVE_PIDS+=($!)
+    log INFO "Native mode: also watching the game's private ${priv[*]#/proc/$pid/root}"
+    # whatever was written before the watcher existed (the first moments of the run)
+    local f
+    while IFS= read -r -d '' f; do native_fs_event CLOSE_WRITE "$f"; done < <(find "${priv[@]}" -xdev -type f -print0 2>/dev/null | head -z -n 500)
+  fi
+  return 0
+}
 
 WATCH_PATHS=()
 
@@ -443,7 +498,7 @@ native_sig() {
   local c a
   { read -r c < "/proc/$1/comm"; } 2>/dev/null || return 1
   { mapfile -d '' -t a < "/proc/$1/cmdline"; } 2>/dev/null || return 1
-  [ "${#a[@]}" -gt 0 ] || return 1          # no command line yet (or a zombie): look again next poll
+  [ "${#a[@]}" -gt 0 ] && [ -n "${a[0]}" ] || return 1   # no command line yet (mid-exec, or a zombie): look again next poll
   NSIG="$c|${a[*]}"
 }
 
@@ -454,7 +509,11 @@ native_script_of() {
   NSCRIPT=""
   { mapfile -d '' -t a < "/proc/$1/cmdline"; } 2>/dev/null || return 1
   base="${a[0]##*/}"
-  [[ "$base" =~ ^(bash|sh|dash|zsh|ksh|python[0-9.]*|perl|ruby|php|node|nodejs|lua[0-9.]*)$ ]] || return 1
+  # the kernel's own name for the program counts as well: a symlink to /bin/sh run as "helper" has no
+  # interpreter name in argv, and neither does a "#!/bin/sh" script started through a symlink
+  local eb; eb="$(readlink "/proc/$1/exe" 2>/dev/null)" || eb=""; eb="${eb% (deleted)}"; eb="${eb##*/}"
+  [[ "$base" =~ ^(bash|sh|dash|zsh|ksh|ash|python[0-9.]*|perl|ruby|php|node|nodejs|lua[0-9.]*)$ ]] \
+    || [[ "$eb" =~ ^(bash|sh|dash|zsh|ksh|ash|python[0-9.]*|perl|ruby|php|node|nodejs|lua[0-9.]*)$ ]] || return 1
   for ((i=1; i<${#a[@]}; i++)); do
     case "${a[i]}" in
       -c|-e|-r|-E) return 1 ;;                  # inline code: native_classify_proc looks at that
@@ -478,6 +537,7 @@ NATIVE_BURST_WARN="${NATIVE_BURST_WARN:-40}"       # new processes in the last 1
 NATIVE_BURST_ALERT="${NATIVE_BURST_ALERT:-150}"
 NATIVE_WARNS_ALERT="${NATIVE_WARNS_ALERT:-6}"      # unusual-process warnings in one run before it becomes an alert
 NATIVE_UNOBS_SHELL_WARN="${NATIVE_UNOBS_SHELL_WARN:-60}"   # unseen short-lived children of ONE shell script before it is worth a warning
+declare -A SIGP=()
 declare -A SIG_BY_PID=() SPAWN_N=() SPAWN_FLAG=() SCRIPT_SCAN=() CMINFLT=() KIDS_PREV=() UNOBS_N=() KNOWN=()
 NEW_TS=(); BURST_FLAG=0; PROC_WARNS=0; WARNS_FLAG=0; UNOBS_TOTAL=0
 
@@ -519,7 +579,13 @@ native_poll_pid() {
       UNOBS_TOTAL=$((UNOBS_TOTAL+1))
       n=$(( ${UNOBS_N[$key]:-0} + 1 )); UNOBS_N[$key]=$n
       cmd="$(read_cmdline "$pid")"
-      if [[ "$({ read -r k < "/proc/$pid/comm"; } 2>/dev/null; echo "$k")" =~ ^(bash|sh|dash|zsh)$ ]]; then
+      k=""; { read -r k < "/proc/$pid/comm"; } 2>/dev/null || true
+      if [[ "$k" =~ ^(firejail|Xephyr|Xvfb|xauth)$ ]]; then
+        # firejail's own private-X helper starts and reaps xauth/xdpyinfo-style children while the jail is set up
+        # (FJ_XEPHYR=1): that is the sandbox, not the game
+        CMINFLT[$key]="$cur"; KIDS_PREV[$key]="$kids"; return 0
+      fi
+      if [[ "$k" =~ ^(bash|sh|dash|zsh)$ ]]; then
         [ "$n" -eq "$NATIVE_UNOBS_SHELL_WARN" ] && log WARN "pid=$pid (a shell script) ran $n short commands that finished before they could be inspected (what they were is unknown; a game rarely does this): $cmd"
       else
         [ "$n" -eq 1 ] && log WARN "pid=$pid started a child process that finished before it could be inspected (what it ran is unknown; a game rarely does this): $cmd"
@@ -560,13 +626,19 @@ while kill -0 "$FIREJAIL_PID" 2>/dev/null; do
   fi
   refresh_tree
   LIVE_KEYS=()
+  SIGP=()
 
   for pid in $(walk "$FIREJAIL_PID"); do
     pid_key "$pid" || continue
     key="$PID_KEY"
     LIVE_KEYS[$key]=1
     rejudge=0
-    if [ "$MODE" = native ]; then native_poll_pid "$pid" "$key"; fi
+    if [ "$MODE" = native ]; then
+      native_poll_pid "$pid" "$key"
+      native_sig "$pid" && SIGP[$pid]="$NSIG"
+      # the game's /tmp: as soon as a process inside the jail exists
+      if [ -z "$TMP_STATE" ]; then native_try_watch_tmp "$pid" || true; fi
+    fi
     if [ -n "${SEEN_PIDS[$key]:-}" ]; then
       # native: a process that exec()ed something else is judged again as what it is now
       if [ "$MODE" = native ] && native_sig "$pid" && [ "$NSIG" != "${SIG_BY_PID[$key]:-}" ]; then
@@ -574,6 +646,18 @@ while kill -0 "$FIREJAIL_PID" 2>/dev/null; do
       else
         continue
       fi
+    elif [ "$MODE" = native ]; then
+      # Native: judge a process the FIRST time it is seen. (The two-polls rule made any child that lived less than two
+      # polls invisible, which is a gap anyone can aim for.) A child that has only forked still shows its parent's
+      # name and command line, which the parent was already judged as; it is left alone until it execs something
+      # else, which the signature check above then judges as what it has become.
+      native_sig "$pid" || continue
+      ppk="${PPID_OF[$pid]:-0}"
+      if [ -n "${SIGP[$ppk]:-}" ] && [ "$NSIG" = "${SIGP[$ppk]}" ]; then
+        SEEN_PIDS[$key]=1; SIG_BY_PID[$key]="$NSIG"
+        continue
+      fi
+      SEEN_PIDS[$key]=1
     else
       # only inspect a process once it has been seen on two consecutive polls
       if [ -z "${PENDING_PIDS[$key]:-}" ]; then
@@ -585,7 +669,7 @@ while kill -0 "$FIREJAIL_PID" 2>/dev/null; do
     fi
 
     cmd="$(read_cmdline "$pid")"
-    [ -z "$cmd" ] && continue
+    [ -z "${cmd// /}" ] && continue
     exe="${cmd%% *}"
     exe_base="${exe##*[\\/]}"   # handles C:\windows\system32\cmd.exe too
 
@@ -605,18 +689,23 @@ while kill -0 "$FIREJAIL_PID" 2>/dev/null; do
       [ -n "$nexe" ] || nexe="$comm"
       if native_sig "$pid"; then SIG_BY_PID[$key]="$NSIG"; fi
       native_script_of "$pid" || true
-      res="$(native_classify_proc "$nexe" "${exe##*/}" "$cmd" "$link" "${NSCRIPT##*/}")"
-      if [ -z "$res" ] && [ -n "$NSCRIPT" ]; then
-        # the script's own text, judged once per file
+      ncwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+      res="$(native_classify_proc "$nexe" "${exe##*/}" "$cmd" "$link" "${NSCRIPT##*/}" "$ncwd" "$NSCRIPT")"
+      # An ALERT from the process rules stands on its own. Otherwise the script's own text is judged as well (once
+      # per file), even when the process already earned a WARN: a script run from /tmp must not hide what is in it.
+      sres=""
+      if [ -n "$NSCRIPT" ] && [ "${res%%$'\t'*}" != ALERT ]; then
         if [ -z "${SCRIPT_SCAN[$NSCRIPT]:-}" ]; then
           SCRIPT_SCAN[$NSCRIPT]="$(native_scan_script "$NSCRIPT")"
           [ -n "${SCRIPT_SCAN[$NSCRIPT]}" ] || SCRIPT_SCAN[$NSCRIPT]="-"
         fi
-        if [ "${SCRIPT_SCAN[$NSCRIPT]}" != "-" ]; then
-          IFS=$'\t' read -r nlevel _ nmsg <<< "${SCRIPT_SCAN[$NSCRIPT]}"
-          log "$nlevel" "Script ${NSCRIPT##*/} (run by $nexe): $nmsg: pid=$pid cmd=$cmd"
-        fi
-      elif [ -n "$res" ]; then
+        [ "${SCRIPT_SCAN[$NSCRIPT]}" != "-" ] && sres="${SCRIPT_SCAN[$NSCRIPT]}"
+      fi
+      if [ -n "$sres" ]; then
+        IFS=$'\t' read -r nlevel _ nmsg <<< "$sres"
+        log "$nlevel" "Script ${NSCRIPT##*/} (run by $nexe): $nmsg: pid=$pid cmd=$cmd"
+      fi
+      if [ -n "$res" ]; then
         IFS=$'\t' read -r nlevel _ nmsg <<< "$res"
         log "$nlevel" "$nmsg: pid=$pid cmd=$cmd"
         if [ "$nlevel" = WARN ]; then
@@ -693,7 +782,14 @@ done
   kill "$INOTIFY_PID" 2>/dev/null
 }
 
-if [ "$MODE" = native ] && [ "$UNOBS_TOTAL" -gt 0 ]; then log INFO "$UNOBS_TOTAL time(s) a child process ran and exited between two polls (every ${POLL_INTERVAL:-5}s), so its command line was never seen"; fi
+if [ "$MODE" = native ] && [ "$UNOBS_TOTAL" -gt 0 ]; then log INFO "Monitor coverage: $UNOBS_TOTAL time(s) a child process ran and exited between two polls (every ${POLL_INTERVAL:-5}s), so its command line was never seen"; fi
+if [ "$MODE" = native ]; then
+  case "$TMP_STATE" in
+    on) ;;
+    off) ;;   # already logged as a WARN
+    *) log INFO "Monitor coverage: no process inside the jail was reachable (the run was too short?), so the game's /tmp was not watched in this run" ;;
+  esac
+fi
 # logged before the final flush: afterwards nothing would write it to the alert log any more
 log INFO "Game process ended. Full log: $ALERTLOG"
 

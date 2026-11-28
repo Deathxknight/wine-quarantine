@@ -43,6 +43,15 @@ take() {   # take <outdir>
       done
     done
   } > "$out/home.sums"
+  # inventory of everything else in the game's private home (size + mtime, no hashing): the persistence list above
+  # is a denylist, so without this an arbitrary write (work/data.txt) is invisible. Only for a private home: when the
+  # real $HOME is exposed there is no way to tell the game's writes from everything else you did.
+  if [ "${WQ_MONITOR_PRIVATE:-1}" = 1 ] && [ -d "$HOME_DIR" ]; then
+    find "$HOME_DIR" -xdev \( -path "$HOME_DIR/.cache" -o -path '*/mesa_shader_cache*' -o -path '*/shader_cache' -o -path '*/GPUCache' \) -prune -o \
+      -type f -printf '%P\t%s\t%T@\n' 2>/dev/null | LC_ALL=C sort > "$out/home.files"
+  else
+    : > "$out/home.files"
+  fi
   # every file under game/ with an exec bit, or an ELF-ish name; path only, so a game updating
   # an existing binary is not noise but a newly appearing one is
   if [ -d "$GAMEDIR/game" ]; then
@@ -121,6 +130,32 @@ case "$MODE" in
       echo "removed  ~/$name" >> "$DIFFLOG"
       log WARN "Home diff: removed ~/$name"
     done
+
+    # everything else that changed in the private home (not a persistence path: informational, listed in full in the log)
+    if [ -f "$SNAPDIR/home.files" ] && [ -s "$NOW/home.files" -o -s "$SNAPDIR/home.files" ]; then
+      declare -A FB=() FA=()
+      while IFS=$'\t' read -r n sz mt; do [ -n "$n" ] && FB[$n]="$sz:$mt"; done < "$SNAPDIR/home.files"
+      while IFS=$'\t' read -r n sz mt; do [ -n "$n" ] && FA[$n]="$sz:$mt"; done < "$NOW/home.files"
+      HC=(); HM=(); HR=()
+      for n in "${!FA[@]}"; do
+        # files already reported above (persistence paths) are not listed twice
+        [ -n "${AFTER[$n]:-}" ] && continue
+        if [ -z "${FB[$n]:-}" ]; then HC+=("$n"); elif [ "${FB[$n]}" != "${FA[$n]}" ]; then HM+=("$n"); fi
+      done
+      for n in "${!FB[@]}"; do [ -z "${FA[$n]:-}" ] && [ -z "${BEFORE[$n]:-}" ] && HR+=("$n"); done
+      if [ $(( ${#HC[@]} + ${#HM[@]} + ${#HR[@]} )) -gt 0 ]; then
+        {
+          echo "other files in the private home (not a persistence path):"
+          [ "${#HC[@]}" -gt 0 ] && printf '%s\n' "${HC[@]}" | LC_ALL=C sort | while IFS= read -r n; do echo "  created   ~/$n"; done
+          [ "${#HM[@]}" -gt 0 ] && printf '%s\n' "${HM[@]}" | LC_ALL=C sort | while IFS= read -r n; do echo "  modified  ~/$n"; done
+          [ "${#HR[@]}" -gt 0 ] && printf '%s\n' "${HR[@]}" | LC_ALL=C sort | while IFS= read -r n; do echo "  removed   ~/$n"; done
+        } >> "$DIFFLOG"
+        first=""; [ $(( ${#HC[@]} + ${#HM[@]} )) -gt 0 ] && first="$(printf '%s\n' ${HC[@]+"${HC[@]}"} ${HM[@]+"${HM[@]}"} | LC_ALL=C sort | head -n1)"
+        log INFO "Home diff: ${#HC[@]} other file(s) created, ${#HM[@]} modified, ${#HR[@]} removed in the private home outside the persistence paths${first:+ (first: ~/$first)}"
+      fi
+    elif [ "${WQ_MONITOR_PRIVATE:-1}" != 1 ]; then
+      log INFO "Home diff: the real home is exposed, so writes outside the persistence paths are not inventoried"
+    fi
 
     # new executables / libraries under game/
     NEWEXEC="$(LC_ALL=C comm -13 "$SNAPDIR/game-exec.list" "$NOW/game-exec.list")"
